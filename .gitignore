@@ -1,0 +1,9 @@
+vae*/
+saved/
+mav_baselines.egg-info/
+build/
+exp_vae/
+datasets/
+*.bag
+.catkin_tools/
+.vscode/

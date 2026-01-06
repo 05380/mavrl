@@ -1,0 +1,62 @@
+unity:
+  scene_id: 1 # 0 warehouse, 1 garage, 3 natureforest
+  render: no
+  spawn_trees: false
+  spawn_objects: true
+  start_area: [16, 1.6]
+  start_origin: [0, -1.8]
+  radius_area: 3.0
+  radius_origin: 3.2
+  end_area: [16, 1.6]
+  end_origin: [0, 28]
+  bounding_box: [20.0, 30.0] # spawn objects within this bounding box
+  bounding_box_origin: [-10.0, 0.8] # relative to the quadrotor start position
+  min_object_scale: [0.5, 0.5, 2.6]   # scale of objects in meters, will sample uniformly between bounds
+  max_object_scale: [1.0, 1.0, 3.8]   # scale of objects in meters, will sample uniformly between bounds
+  basic_size: [1.0, 1.0, 2]
+  if_get_pointcloud: true
+  range: [20, 30, 4]
+  origin: [0.0, 15.0, 2.0]
+  res: 0.10
+  
+drone:
+  length: 0.4
+  width: 0.4 
+
+simulation:
+  seed: 1
+  sim_dt: 0.05
+  max_t: 5.0
+  action_mode: 1 # 0 velocity, 1 acceleration
+  num_envs: 1
+  num_threads: 1
+  act_max: [4.0, 4.0, 3.5, 0.0]
+  act_min: [-4.0, -4.0, -3.5, -0.0]
+
+rewards:
+  colli_coeff: -0.035 # reward coefficient for position
+  risk_coeff: -0.002 # reward coefficient for orientation
+  goal_coeff: 0.04 # reward coefficient for linear velocity
+  input_coeff: -0.00005 # reward coefficient for changes of input
+  lin_vel_coeff: -0.035
+  names:
+    [
+      "goal_reward",
+      "colli_penalty",
+      "risk_penalty",
+      "input_penalty",
+      "vel_lin_penalty",
+      "total",
+    ]
+
+rgb_camera:
+  on: yes
+  t_BC: [0.0, 0.0, 0.3] # translational vector of the camera with repect to the body frame
+  r_BC: [0.0, 0.0, 0.0] # rotational angle (roll, pitch, yaw) of the camera in degree.
+  channels: 3
+  width: 256
+  height: 256
+  fov: 70.0
+  enable_depth: yes 
+  enable_segmentation: no
+  enable_opticalflow: no
