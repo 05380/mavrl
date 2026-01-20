@@ -62,7 +62,7 @@ def parser():
 
 def main():
   args = parser().parse_args()
-  # load configurations
+  #1. 配置加载阶段 load configurations
   if args.scene_id == 0:
     cfg = YAML().load(
         open(
@@ -75,37 +75,45 @@ def main():
             os.environ["AVOIDBENCH_PATH"] + "/../mavrl/configs/control/config_new_out.yaml", "r"
         )
     )
-
+  #2. 环境初始化阶段
   train_env = AvoidVisionEnv_v1(dump(cfg, Dumper=RoundTripDumper), False)
   train_env = wrapper.VisionEnvVec(train_env, logdir=args.logdir)
   # set random seed
   configure_random_seed(args.seed, env=train_env)
 
-  # create evaluation environment
+  #3. 评估环境创建
   old_num_envs = cfg["simulation"]["num_envs"]
-  old_render = cfg["unity"]["render"]
+  old_render = cfg["unity"]["render"]#原先配置
   cfg["simulation"]["num_envs"] = 1
   cfg["unity"]["render"] = "no"
-  eval_env = wrapper.VisionEnvVec(
+  eval_env = wrapper.VisionEnvVec(#创建评估环境
       AvoidVisionEnv_v1(dump(cfg, Dumper=RoundTripDumper), False), logdir=args.logdir
   )
+  
   cfg["simulation"]["num_envs"] = old_num_envs
   cfg["unity"]["render"] = old_render
+  #关键步骤：让评估环境共享训练环境的Unity连接 避免重复建立Unity连接，提高效率
   eval_env.wrapper.setUnityFromPtr(train_env.wrapper.getUnityPtr())
 
   # eval_env.getPointClouds('', 0, False)
   # save the configuration and other files
   rsg_root = os.path.dirname(os.path.abspath(__file__))
   log_dir = rsg_root + "/saved"
-  
+  #4. 异步渲染线程
   new_thread = threading.Thread(target=rendering_thread, args=(train_env,))
   new_thread.start()
-
+  """
+  5. Unity仿真连接
+  异步渲染：通过独立线程处理可视化，不影响训练效率
+  Unity环境准备：建立连接、生成障碍物、处理点云数据
+  环境同步：确保训练和评估环境使用相同的数据
+  状态管理：通过全局变量协调多线程间的操作顺序
+  """
   device = get_device("auto")
   if args.render:
     global unity_ready, save_finished
     unity_ready = train_env.connectUnity()
-    train_env.spawnObstacles(change_obs=True)
+    train_env.spawnObstacles(change_obs=True)#生成障碍物
     while not train_env.ifSceneChanged():
       train_env.spawnObstacles(change_obs=False)
       time.sleep(0.01)
@@ -114,7 +122,7 @@ def main():
       time.sleep(0.02)
     time.sleep(5.0)
     train_env.readPointClouds(0)
-    while(not train_env.getReadingState()):
+    while(not train_env.getReadingState()):#点云数据是由Unity仿真环境根据场景中的障碍物和深度图生成的虚拟点云
       time.sleep(0.02)
     time.sleep(1.0)
     eval_env.readPointClouds(0)
@@ -122,16 +130,31 @@ def main():
       time.sleep(0.02)
     time.sleep(1.0)
     save_finished = True    
+  
+  """
+  6. 模型策略加载与训练
+  条件分支：
+  （1）重训练/测试：从检查点加载模型
+  （2）新训练：创建新策略网络
 
+  模型恢复：支持从检查点继续训练或测试
+  灵活加载：可以选择性加载网络参数
+  设备适配：自动适应可用的硬件设备
+  网络配置：根据需要调整网络结构  
+  """
+  #当需要重训练(args.retrain=1)或测试模式(args.train=0)时执行
   if (args.retrain or not args.train):
+    #模型权重加载
     weight = os.environ["AVOIDBENCH_PATH"] + "/../mavrl/saved/RecurrentPPO_{0}/Policy/iter_{1:05d}.pth".format(args.trial, args.iter)
     saved_variables = torch.load(weight, map_location=device)
-    # Create policy object
+    # 策略网络创建,     创建LSTM策略网络，特征维度为64,使用保存的网络结构参数初始化
     policy = MultiInputLstmPolicy(features_dim=64, **saved_variables["data"])
-    #
+    #动作网络调整,      在动作网络末尾添加Tanh激活函数，限制输出范围
     policy.action_net = torch.nn.Sequential(policy.action_net, torch.nn.Tanh())
-    # Load weights
+    # 标准差设置， 设置动作分布的标准差参数
     saved_variables["state_dict"]['log_std'] = torch.tensor([-0.0, -0.0, -0.0, -0.0], device=device)
+    #选择性参数加载控制
+    #当args.nocontrol=1时，移除动作网络和价值网络的参数；这样只加载基础网络结构，而不加载控制相关的参数
     if args.nocontrol:
       saved_variables["state_dict"].pop('action_net.0.weight')
       saved_variables["state_dict"].pop('action_net.0.bias')
@@ -145,13 +168,21 @@ def main():
       saved_variables["state_dict"].pop('mlp_extractor.policy_net.2.bias')
       saved_variables["state_dict"].pop('mlp_extractor.value_net.2.weight')
       saved_variables["state_dict"].pop('mlp_extractor.value_net.2.bias')
-
+    #权重加载
     policy.load_state_dict(saved_variables["state_dict"], strict=False)
     # policy.log_std_init = -0.5
     policy.to(device)
-  else:
+  else:#新训练模式
+    #当不需要加载预训练模型时，直接使用策略名称字符串
     policy = "MultiInputLstmPolicy"
 
+  """
+  7. PPO训练模型参数构建
+
+  算法选择：使用递归PPO（RecurrentPPO）算法
+  网络架构：策略网络[256,256]，价值网络[512,512]
+  超参数配置：学习率、折扣因子、批次大小等
+  """
   if args.train:
     model = RecurrentPPO(
       tensorboard_log=log_dir,
@@ -186,9 +217,11 @@ def main():
       if_change_maps=True,
       is_forest_env=(args.scene_id==1),
     )
-    #
+    #8. 训练/测试执行。
+    #训练模式：执行800万时间步的强化学习训练
     model.learn(total_timesteps=int(8e6), log_interval=(10, 20))
     
+    #测试模式：在评估环境上测试策略性能
   else:
     test_vision_policy(eval_env, policy)
 
