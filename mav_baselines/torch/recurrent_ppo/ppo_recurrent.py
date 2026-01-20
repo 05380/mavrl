@@ -604,9 +604,15 @@ class RecurrentPPO(OnPolicyAlgorithm):
 
         return True
 
+    #更新策略网络，使用已收集的经验数据优化策略，提高智能体的性能。
     def train(self) -> None:
+        
         """
-        Update policy using the currently gathered rollout buffer.
+        Update policy using the currently gathered rollout buffer
+        1. 初始化阶段.
+        切换策略到训练模式（激活dropout/batch norm）
+        更新学习率
+        计算当前的裁剪范围（随训练进度变化）
         """
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
@@ -618,6 +624,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
         if self.clip_range_vf is not None:
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)
 
+        """
+        2. 损失统计容器
+        """
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
@@ -631,11 +640,21 @@ class RecurrentPPO(OnPolicyAlgorithm):
         # print(self.policy.state_dict()['action_net.0.bias'])
         # print(self.policy.state_dict()['value_net.bias'])
         # train for n_epochs epochs
+
+        """
+        3. 多轮训练循环
+        外层循环：对同一批数据进行多次训练（n_epochs 次）
+        内层循环：遍历批次数据
+        """
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get_ppo_need(self.batch_size):
                 actions = rollout_data.actions
+                """
+                4. 动作处理
+                对离散动作空间进行类型转换
+                """
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
@@ -656,10 +675,17 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 # print("rollout_data.lstm_states: ", rollout_data.lstm_states[0][0].shape)
                 # Normalize advantage
                 advantages = rollout_data.advantages
+                """
+                5. 优势函数归一化
+                归一化优势值，提高训练稳定性
+                """
                 if self.normalize_advantage:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
                 # ratio between old and new policy, should be one at the first iteration
+                """
+                6. PPO核心算法
+                """
                 ratio = th.exp(log_prob - rollout_data.old_log_prob)
                 # print("log_prob: ", log_prob)
                 # clipped surrogate loss
@@ -706,14 +732,18 @@ class RecurrentPPO(OnPolicyAlgorithm):
                     log_ratio = log_prob - rollout_data.old_log_prob
                     approx_kl_div = th.mean(((th.exp(log_ratio) - 1) - log_ratio)).cpu().numpy()
                     approx_kl_divs.append(approx_kl_div)
-
+                """
+                7. 早停机制,当KL散度超过阈值时提前停止，防止策略更新过大
+                """
                 if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
                     continue_training = False
                     if self.verbose >= 1:
                         print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
                     break
                 
-                # Optimization step
+                """
+                8. 反向传播优化
+                """
                 self.policy.optimizer.zero_grad()
                 loss.backward()
                 # Clip grad norm
@@ -736,7 +766,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
         self.logger.record("train/explained_variance", explained_var)
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
-
+        """
+        9. 日志记录
+        """
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
@@ -798,21 +830,24 @@ class RecurrentPPO(OnPolicyAlgorithm):
         self.logger.record("test/trial_numbers_hard2", trial_numbers3)
         self.logger.dump(step=iteration)
 
+    """主训练循环函数，用于训练带有循环神经网络的PPO策略。"""
     def learn(
+        #1. 参数定义
         self: SelfRecurrentPPO,
-        total_timesteps: int,
+        total_timesteps: int,#总训练步数
         callback: MaybeCallback = None,
         log_interval: Tuple = (10, 100),
-        eval_env: Optional[GymEnv] = None,
+        eval_env: Optional[GymEnv] = None,#评估环境
         eval_freq: int = -1,
         n_eval_episodes: int = 5,
         tb_log_name: str = "RecurrentPPO",
         eval_log_path: Optional[str] = None,
         reset_num_timesteps: bool = True,
     ) -> SelfRecurrentPPO:
+        #2. 初始化阶段
         iteration = 0
 
-        total_timesteps, callback = self._setup_learn(
+        total_timesteps, callback = self._setup_learn(#调用父类的 _setup_learn 方法完成基础设置,,返回更新后的总步数和回调函数
             total_timesteps,
             eval_env,
             callback,
@@ -822,24 +857,25 @@ class RecurrentPPO(OnPolicyAlgorithm):
             reset_num_timesteps,
             tb_log_name,
         )
-
+        #3. 配置文件保存,将环境配置保存为YAML文件,便于实验复现和参数追踪
         new_cfg_dir = self.logger.get_dir() + "/config.yaml"
         with open(new_cfg_dir, "w") as outfile:
             YAML().dump(self.env_cfg, outfile)
 
         callback.on_training_start(locals(), globals())
-
+        #4. 主训练循环
         while self.num_timesteps < total_timesteps:
-
-            continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps, iteration=iteration)
+            #4.1 经验收集,调用 collect_rollouts 方法与环境交互收集经验
+            continue_training = self.collect_rollouts(
+                self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps, iteration=iteration)
 
             if continue_training is False:
                 break
-
+            #4.2 迭代计数更新
             iteration += 1
             self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
 
-            # Display training infos
+            # 4.3 日志记录
             if log_interval is not None and iteration % log_interval[0] == 0:
                 time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
                 fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
@@ -862,16 +898,16 @@ class RecurrentPPO(OnPolicyAlgorithm):
                         ),
                     )
                 self.logger.dump(step=self.num_timesteps)
-
+            #4.4 策略训练
             self.train()
-
+            #4.5 模型保存
             if log_interval is not None and iteration % log_interval[1] == 0:
-
+                
                 policy_path = self.logger.get_dir() + "/Policy"
                 os.makedirs(policy_path, exist_ok=True)
                 self.policy.save(policy_path + "/iter_{0:05d}.pth".format(iteration))
 
-                # self.eval(iteration)
+        #5. 训练结束处理       # self.eval(iteration)
         callback.on_training_end()
 
         return self

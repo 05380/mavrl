@@ -806,14 +806,14 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
         sde_net_arch: Optional[List[int]] = None,
         use_expln: bool = False,
         squash_output: bool = False,
-        features_extractor_class: Type[BaseFeaturesExtractor] = Encoder,
+        features_extractor_class: Type[BaseFeaturesExtractor] = Encoder,#特征提取器（默认使用Encoder） 
         features_extractor_kwargs: Optional[Dict[str, Any]] = None,
         share_features_extractor: bool = True,
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
-        lstm_hidden_size: int = 256,
-        n_lstm_layers: int = 1,
+        lstm_hidden_size: int = 256,#LSTM隐藏层单元数量（默认256）
+        n_lstm_layers: int = 1,#LSTM层数（默认1层）
         shared_lstm: bool = False,
         enable_critic_lstm: bool = True,
         states_dim: int = 0,

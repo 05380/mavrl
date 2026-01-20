@@ -12,6 +12,17 @@ from stable_baselines3.common.utils import get_device
 class Encoder(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 64):
 
+        """
+        1. 初始化过程
+        输入处理: 从 observation_space 中识别图像空间
+        卷积层: 6层卷积层逐步降维
+        conv1: 输入→8通道 (kernel=4, stride=2)
+        conv2: 8→16通道
+        conv3: 16→32通道
+        conv4: 32→64通道
+        conv5: 64→128通道
+        conv6: 128→256通道
+        """
         image_observation_space = None
         for key, subspace in observation_space.spaces.items():
             if is_image_space(subspace):
@@ -27,9 +38,19 @@ class Encoder(BaseFeaturesExtractor):
         # Compute shape by doing one forward pass
         # with th.no_grad():
         #     n_flatten = self.conv6(self.conv5(self.conv4(self.conv3(self.conv2(self.conv1(th.as_tensor(image_observation_space.sample()[None][:, :1, :, :]).float())))))).shape
+        """
+        2. 网络层设计
+        全连接层:
+        linear: 将特征映射到指定维度 (features_dim)
+        fc_logsigma: 用于变分编码(当前被注释)
+        """
         self.linear = nn.Linear(2*2*256, features_dim)
         self.fc_logsigma = nn.Linear(2*2*256, features_dim)
 
+    """
+    3. 前向传播流程
+    observations → conv1 → relu → conv2 → relu → ... → conv6 → relu → flatten → linear → mu
+    """
     def forward(self, observations: th.Tensor) -> th.Tensor:
         x = nn.functional.relu(self.conv1(observations))
         x = nn.functional.relu(self.conv2(x))
