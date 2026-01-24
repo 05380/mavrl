@@ -141,15 +141,18 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         self.lstm_kwargs = lstm_kwargs or {}
         self.shared_lstm = shared_lstm
         self.enable_critic_lstm = enable_critic_lstm
+        ## 定义一个策略LSTM网络 - 用于后续forward_rnn（）中的_process_sequence（）将图像特征加上lstm
         self.lstm_actor = nn.LSTM(
-            self.features_dim + states_dim,
+            self.features_dim + states_dim,#64 + 0,输入: CNN特征
             lstm_hidden_size,
-            num_layers=n_lstm_layers,
+            num_layers=n_lstm_layers,# 输出: 256维表示
             **self.lstm_kwargs,
         )
+        # 用于预测未来帧的线性层
         self.mu_linear = nn.Linear(lstm_hidden_size, 3 * (self.features_dim + states_dim))
         # For the predict() method, to initialize hidden states
         # (n_lstm_layers, batch_size, lstm_hidden_size)
+        # LSTM隐藏状态形状定义
         self.lstm_hidden_state_shape = (n_lstm_layers, 1, lstm_hidden_size)
         self.critic = None
         self.lstm_critic = None
@@ -166,7 +169,10 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         # (size of the output of the actor lstm)
         if not (self.shared_lstm or self.enable_critic_lstm):
             self.critic = nn.Linear(self.features_dim, lstm_hidden_size)
-        # Use a separate LSTM for the critic
+        # # 价值LSTM（可选）- 用于价值评估
+        #这个项目使用共享 LSTM 策略：
+        # shared_lstm = True
+        # → 只用 Actor LSTM，Critic 使用 Actor 输出 + detach()
         if self.enable_critic_lstm:
             self.lstm_critic = nn.LSTM(
                 self.features_dim + states_dim,
@@ -174,12 +180,28 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
                 num_layers=n_lstm_layers,
                 **self.lstm_kwargs,
             )
+        # 解码器 - 用于特征重建
         self.feature_decoder0 = Decoder(self.observation_space, self.features_dim + states_dim)
         # self.feature_decoder1 = Decoder(self.observation_space, self.features_dim + states_dim)
 
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+   
+    """
+    是策略网络的搭建阶段，负责把“MLP 主干 + 动作分布头 + 价值头 + 优化器”全部创建好。
+    param lr_schedule: 学习率调度器，用于设置初始学习率  
+   
+    调用 _build_mlp_extractor() 创建 actor/critic 的 MLP 主干。
+    根据动作分布类型（高斯/离散/Beta/…）构造对应的 action head。
+    创建 value_net（线性层）输出价值。
+    可选进行正交初始化。
+    创建优化器。
 
+    在 RecurrentActorCriticPolicy 初始化过程中被调用：
+    __init__() → super().__init__(...) →（父类 ActorCriticPolicy）_build()。
+    后续 forward() / evaluate_actions() 使用这里创建的 action/value head。
+    
+    """
     def _build(self, lr_schedule: Schedule) -> None:
         """
         Create the networks and the optimizer.
@@ -229,7 +251,17 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+    """
+    创建策略/价值的 MLP 主干，并把它挂在 self.mlp_extractor 上，
+    供后续动作头/价值头使用。
 
+    被 _build() 调用（见同文件 _build()），
+    而 _build() 在策略初始化时由父类 ActorCriticPolicy 触发。
+
+    训练/推理时，forward()、evaluate_actions() 
+    会调用 self.mlp_extractor.forward_actor/forward_critic，依赖这里创建的 MLP。
+
+    """
     def _build_mlp_extractor(self) -> None:
         """
         Create the policy and value networks.
@@ -242,6 +274,25 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
             device=self.device,
         )
 
+    """
+    功能:
+    把 batch 维度重排为序列维度，处理 LSTM 的时序输入；
+    若 episode_starts 中间有重置点，就逐步循环并对 hidden state 做清零处理；
+    最后把序列输出再展平成 batch。
+
+    输入:
+    features: LSTM 的输入特征，shape 通常是 (batch, lstm.input_size)
+    lstm_states: 上一时刻的 (h, c)
+    episode_starts: 是否新 episode，用于在序列中重置状态
+    lstm: 要用的 LSTM 模块（actor 或 critic）
+
+    输出:
+    lstm_output: 展平后的 LSTM 输出，shape (batch, lstm_hidden_size)
+    lstm_states: 更新后的 (h, c)
+
+    被 forward_rnn() 调用（用于 actor LSTM / critic LSTM）。
+
+    """
     @staticmethod
     def _process_sequence(
         features: th.Tensor,
@@ -261,10 +312,11 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         # LSTM logic
         # (sequence length, batch size, features dim)
         # (batch size = n_envs for data collection or n_seq when doing gradient update)
-        n_seq = lstm_states[0].shape[1]
+        n_seq = lstm_states[0].shape[1] # 从隐状态获取序列数
         # Batch to sequence
         # (padded batch size, features_dim) -> (n_seq, max length, features_dim) -> (max length, n_seq, features_dim)
         # note: max length (max sequence length) is always 1 during data collection
+        ## reshape: 将batch维度重新解释为 (n_seq, max_length)；# 交换轴：[n_seq, max_length, feature_dim] → [max_length, n_seq, feature_dim]
         features_sequence = features.reshape((n_seq, -1, lstm.input_size)).swapaxes(0, 1)
         episode_starts = episode_starts.reshape((n_seq, -1)).swapaxes(0, 1)
         # If we don't have to reset the state in the middle of a sequence
@@ -291,6 +343,27 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         lstm_output = th.flatten(th.cat(lstm_output).transpose(0, 1), start_dim=0, end_dim=1)
         return lstm_output, lstm_states
     
+    """
+    功能:
+    image → extract_features() 得到图像特征
+    state reshape 成状态向量
+    图像特征送入 LSTM（_process_sequence()）得到 latent_pi / latent_vf
+    将 LSTM 输出与状态向量拼接，得到最终的融合特征
+
+    输入:
+    obs: 观测字典，包含 image 与 state
+    lstm_states: actor/critic 的 LSTM 状态
+    episode_starts: episode 起始标记
+
+    输出:
+    latent_pi: 用于策略分支的融合特征
+    latent_vf: 用于价值分支的融合特征
+    RNNStates(...): 更新后的 LSTM states（actor/critic）
+
+    调用关系:
+    在 RecurrentPPO.collect_rollouts() / collect_lstm_rollouts() 中被调用，用于生成动作与价值所需的特征。
+    返回的 latent_pi/latent_vf 会传给 forward() 进一步得到动作分布与价值。
+    """
     def forward_rnn(
         self,
         obs: th.Tensor,
@@ -300,41 +373,86 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         cat_pi = []
         cat_vf = []
         for key, _obs in obs.items():
-            if key == 'image':
+            if key == 'image':#图像数据处理
                 features = self.extract_features(_obs)
-                if self.share_features_extractor:
+                if self.share_features_extractor:#11共享模式，策略和价值网络使用相同特征表示
                     pi_features = vf_features = features
-                else:
+                else:#独立模式：策略网络: pi_features 用于动作选择；价值网络: vf_features 用于状态价值估计
                     pi_features, vf_features = features
-            else:
+            else:#状态向量
+                #状态重塑：原始: [4, n_seq, 7] 4个环境, 多步序列, 7维状态；重塑: [4, 7] 最后一个时间步的状态
                 state_shape = _obs.shape
-                _obs = _obs.reshape([state_shape[0], state_shape[2]]).float()
-                # pi_features = th.cat([pi_features, _obs[:, 4:]], dim=1)
+                # 包含: [log_distance, 水平速度, 目标方向, 速度方向, 
+                #高度差, 竖直速度, 偏航角]
+                _obs = _obs.reshape([state_shape[0], state_shape[2]]).float()#这里得到了状态特征
+                #pi_features = th.cat([pi_features, _obs[:, 4:]], dim=1)
                 # vf_features = th.cat([vf_features, _obs[:, 4:]], dim=1)
+
+
+                #针对策略网络Actor 进行LSTM序列处理，返回更新后的LSTM隐藏状态
+                #latent_pi：Actor LSTM网络处理后的隐状态输出，LSTM对融合特征的时序处理
+                # lstm_states_pi：LSTM处理完当前时间步后的新隐状态和细胞状态保存用于下一步
                 latent_pi, lstm_states_pi = self._process_sequence(pi_features, lstm_states.pi,
-                                            episode_starts, self.lstm_actor)
+                                            #让 LSTM 专注于图像序列的时序关系，因为在 train_policy.py 里构建模型时传了 states_dim=0      
+                                            episode_starts, self.lstm_actor)#这里的pi_features传入的是图像特征，而非融合特征，
+                """
+                针对价值网络
+                三种价值网络处理方式：
+                独立LSTM: 使用单独的价值LSTM网络
+                共享LSTM: 使用策略LSTM输出，但切断梯度
+                线性层: 使用简单的线性变换
+                """
                 if self.lstm_critic is not None:
                     latent_vf, lstm_states_vf = self._process_sequence(vf_features, lstm_states.vf,
                                             episode_starts, self.lstm_critic)
-                elif self.shared_lstm:
+                elif self.shared_lstm:#实际使用
                     latent_vf = latent_pi.detach()
                     lstm_states_vf = (lstm_states_pi[0].detach(), lstm_states_pi[1].detach())
                 else:
                     latent_vf = self.critic(vf_features)
                     lstm_states_vf = lstm_states_pi
-                cat_pi = [latent_pi, _obs]
-                cat_vf = [latent_vf, _obs]
-        latent_pi = th.cat(cat_pi, dim=1)
-        latent_vf = th.cat(cat_vf, dim=1)
+                """拼接处理后的特征和状态向量，形成最终的输入特征"""
+                cat_pi = [latent_pi, _obs] # 策略特征 = [LSTM输出, 状态向量]
+                cat_vf = [latent_vf, _obs]# 价值特征 = [LSTM输出, 状态向量]
+        latent_pi = th.cat(cat_pi, dim=1) # 拼接维度1：[batch, 256+7]
+        latent_vf = th.cat(cat_vf, dim=1) # 拼接维度1：[batch, 256+7]
         return latent_pi, latent_vf, RNNStates(lstm_states_pi, lstm_states_vf)
     
+    """
+    功能:
+    mlp_extractor 将 latent_pi/latent_vf 映射为高层特征；
+    value_net 输出价值；
+    根据 latent_pi_ 构建动作分布并采样动作；
+    计算该动作的 log_prob。
+
+    输入:
+    latent_pi: 策略分支的融合特征（来自 forward_rnn()）
+    latent_vf: 价值分支的融合特征（来自 forward_rnn()）
+    deterministic: 是否用确定性动作（评估时常用）
+
+    输出:
+    actions: 采样/确定性的动作
+    values: 价值估计 V(s)
+    log_prob: 动作对数概率（PPO 计算损失用）
+
+    调用关系:
+    在 RecurrentPPO.collect_rollouts() 中被调用：
+    forward_rnn() 先得到 latent_pi/latent_vf
+    再调用 forward() 得到 actions/values/log_prob
+    训练时用于生成 rollout 数据和 PPO 损失所需量。
+    """
     def forward(self, latent_pi: th.Tensor, latent_vf: th.Tensor,deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        #将LSTM输出变换为适合生成动作分布的特征向量，给策略分支用的高层特征
         latent_pi_ = self.mlp_extractor.forward_actor(latent_pi)
+        #为价值函数生成输入特征，给价值分支用的高层特征。
         latent_vf_ = self.mlp_extractor.forward_critic(latent_vf)
-        # Evaluate the values for the given observations
+        # 计算状态价值函数
         values = self.value_net(latent_vf_)
+        #获取动作分布
         distribution = self._get_action_dist_from_latent(latent_pi_)
+        #采样动作
         actions = distribution.get_actions(deterministic=deterministic)
+        #PPO算法中的策略梯度计算，输出：该动作的对数概率 [batch_size]
         log_prob = distribution.log_prob(actions)
         # print("log_prob: ", log_prob)
         return actions, values, log_prob
@@ -359,7 +477,6 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
                 cat_pi = [latent_pi, _obs]
         latent_pi = th.cat(cat_pi, dim=1)
         return latent_pi, lstm_states_pi
-    
     def _get_action_dist_from_latent(self, latent_pi: th.Tensor) -> Distribution:
         """
         Retrieve action distribution given the latent codes.
@@ -419,6 +536,22 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         return self._get_action_dist_from_latent(latent_pi), lstm_states
 
 
+    """
+    功能:
+    对图像观测做必要的预处理（如归一化），然后用特征提取器（CNN Encoder）提取特征向量。
+
+    输入:
+    obs: th.Tensor：图像观测张量（来自 obs['image']）。
+    features_extractor: Optional[BaseFeaturesExtractor]：可选自定义特征提取器；为空则用 self.features_extractor。
+
+    输出:
+    th.Tensor：图像特征向量（维度为 features_dim）。
+
+    调用关系:
+    在 forward_rnn() / get_distribution() / predict_values() 中处理 obs['image'] 时调用。
+    to_latent() 也会调用它来获取图像的 latent 表示。
+
+    """
     def extract_features(self, obs: th.Tensor, features_extractor: Optional[BaseFeaturesExtractor] = None) -> th.Tensor:
         """
         Preprocess the observation if needed and extract features.
@@ -435,13 +568,38 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
                 ),
                 DeprecationWarning,
             )
-
+        #特征提取器选择，如果没有提供，则使用实例的默认特征提取器
         features_extractor = features_extractor or self.features_extractor
         assert features_extractor is not None, "No features extractor was set"
+        #从观测空间字典中获取图像部分的空间定义
         observation_space = self.observation_space['image']
+        #观测预处理，根据 normalize_images 参数决定是否归一化图像
         preprocessed_obs = preprocess_obs(obs, observation_space, normalize_images=self.normalize_images)
         return features_extractor(preprocessed_obs)
 
+    """
+    功能:
+    根据当前观测估计状态价值 (V(s))。
+
+    输入:
+    obs: th.Tensor：观测字典（image + state）。
+    lstm_states: LSTM 的隐藏/细胞状态（用于 critic）。
+    episode_starts: episode 起始标记，用于必要时重置 LSTM 状态。
+
+    输出:
+    th.Tensor：价值估计，shape 通常是 (batch, 1)。
+
+    主要流程:
+    image → extract_features() 得到图像特征。
+    state → reshape 成状态向量。
+    用 LSTM（或线性层）处理图像特征得到 latent_vf。
+    将 latent_vf 与状态向量拼接。
+    mlp_extractor.forward_critic() → value_net 得到价值。
+
+    调用关系:
+    在 collect_rollouts() 的末尾用于 bootstrap 最后一步的 value。
+    调用mlp_extractor.forward_critic() 和 value_net 输出价值。
+    """
     def predict_values(
         self,
         obs: th.Tensor,
@@ -479,6 +637,23 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         latent_vf = self.mlp_extractor.forward_critic(latent_vf)
         return self.value_net(latent_vf)
     
+    """
+    功能:
+    用给定动作在当前策略下重新计算：价值、动作对数概率、熵（用于 PPO 损失）
+
+    输入:
+    latend_lstm_pi: 策略分支的融合特征（来自 LSTM/拼接后的特征）
+    latend_lstm_vf: 价值分支的融合特征
+    actions: 真实执行过的动作（rollout 里存的）
+
+    输出:
+    values: 价值估计 V(s)
+    log_prob: 给定动作在当前策略下的对数概率
+    entropy: 动作分布熵（用于探索正则）
+
+    调用关系:
+    在 RecurrentPPO.train() 里被调用，用于计算 PPO 的 policy loss、value loss、entropy bonus。
+    """
     def evaluate_actions(self, latend_lstm_pi: th.Tensor, latend_lstm_vf: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         latent_pi = self.mlp_extractor.forward_actor(latend_lstm_pi)
         latent_vf = self.mlp_extractor.forward_critic(latend_lstm_vf)
@@ -489,6 +664,24 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         values = self.value_net(latent_vf)
         return values, log_prob, distribution.entropy()
 
+    """
+    功能:
+    给定观测和 LSTM 状态，计算策略动作并返回更新后的 LSTM 状态。
+
+    输入:
+    observation: th.Tensor：观测（字典或张量，已转成 torch）。
+    lstm_states: LSTM 的 (h, c) 状态。
+    episode_starts: episode 起始标记，用于重置 LSTM。
+    deterministic: 是否使用确定性动作。
+
+    输出:
+    actions: 采样/确定性的动作。
+    lstm_states: 更新后的 LSTM 状态。
+
+    调用关系:
+    被 predict() 调用：predict() 负责把 numpy 转成 tensor、处理 batch 维后再调用 _predict()。
+    """
+    
     def _predict(
         self,
         observation: th.Tensor,
@@ -509,6 +702,24 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         distribution, lstm_states = self.get_distribution(observation, lstm_states, episode_starts)
         return distribution.get_actions(deterministic=deterministic), lstm_states
 
+    """
+    功能:
+    推理接口：给定观测（numpy），返回动作（numpy）和下一步 LSTM 状态；处理输入格式、状态初始化、设备转换、动作后处理等。
+
+    输入:
+    observation: np.ndarray 或 Dict[str, np.ndarray]，原始观测（图像/状态字典）。
+    state: 可选 LSTM 状态 (h, c)；为空则自动初始化为零。
+    episode_start: 可选 episode 起始标记；为空则默认全 False。
+    deterministic: 是否输出确定性动作。
+
+    输出:
+    actions: np.ndarray 动作（已裁剪到动作空间范围）。
+    states: 下一步 LSTM 状态 (h, c)，用于下一次调用。
+
+    调用关系:
+    调用 _predict() 得到动作和新 LSTM 状态。
+    _predict() 内部调用 get_distribution() → forward_rnn() → _get_action_dist_from_latent()。
+    """
     def predict(
         self,
         observation: Union[np.ndarray, Dict[str, np.ndarray]],
@@ -575,6 +786,8 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         return actions, states
             
+    #将观测转换到潜在空间， 主要用于LSTM训练和重建任务，
+    #在 RecurrentPPO.train_lstm() / train_lstm_from_dataset() 等 LSTM 重构训练路径中调用，用于得到固定的图像 latent。
     def to_latent(self, obs):
         with th.no_grad():
             if isinstance(obs, dict):
@@ -604,6 +817,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
                     reconstruction.append(None)
         return reconstruction
 
+    """
+    
+    """
     def predict_lstm(self, 
         latent_obs: th.Tensor,
         lstm_states: Tuple[th.Tensor, th.Tensor],
@@ -792,7 +1008,7 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
         constructor.
     """
 
-    def __init__(
+    def __init__(#传递所有参数给基类进行初始化
         self,
         observation_space: spaces.Space,
         action_space: spaces.Space,
@@ -806,7 +1022,8 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
         sde_net_arch: Optional[List[int]] = None,
         use_expln: bool = False,
         squash_output: bool = False,
-        features_extractor_class: Type[BaseFeaturesExtractor] = Encoder,#特征提取器（默认使用Encoder） 
+        ##特征提取器（默认使用Encoder），适用场景: 同时处理图像和状态向量等混合输入，而父类默认: FlattenExtractor
+        features_extractor_class: Type[BaseFeaturesExtractor] = Encoder, 
         features_extractor_kwargs: Optional[Dict[str, Any]] = None,
         share_features_extractor: bool = True,
         normalize_images: bool = True,
@@ -824,7 +1041,7 @@ class RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy):
         reconstruction_steps: int = 2,
         lstm_kwargs: Optional[Dict[str, Any]] = None,
     ):
-        super().__init__(
+        super().__init__(#通过 super() 调用父类构造函数，
             observation_space,
             action_space,
             lr_schedule,

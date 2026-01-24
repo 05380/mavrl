@@ -18,11 +18,23 @@ from stable_baselines3.common.vec_env.util import (copy_obs_dict, dict_to_obs,
 from os.path import join, exists
 import torch
 from utils.misc import LSIZE, n_seq
-
+#负责把底层返回的深度图/状态等数据，整理成 obs 字典（image + state），并维护序列长度 n_seq 的历史帧。
 class VisionEnvVec(VecEnv):
-    #
+    """
+    把底层 AvoidVisionEnv_v1 包装成 SB3 的 VecEnv 风格，
+    并初始化观测/动作空间、缓存、序列内存。
+
+    train_env = AvoidVisionEnv_v1(dump(cfg, Dumper=RoundTripDumper), False)
+    train_env = wrapper.VisionEnvVec(train_env, logdir=args.logdir)
+    """
     def __init__(self, impl, logdir=None):
         self.wrapper = impl
+        """
+        1) 读底层环境维度
+        从 wrapper 读取：动作维度、序列长度、观测维度、
+        状态维度、奖励维度、目标维度、图像尺寸等
+        （如 getActDim(), getObsDim(), getImgWidth()）。
+        """
         self.act_dim = self.wrapper.getActDim()
         self.seq_dim = self.wrapper.getSeqDim()
         self.obs_dim = self.wrapper.getObsDim()
@@ -31,6 +43,7 @@ class VisionEnvVec(VecEnv):
         self.goal_obs_dim = self.wrapper.getGoalObsDim()
         self.img_width = self.wrapper.getImgWidth()
         self.img_height = self.wrapper.getImgHeight()
+        #2) 观测/动作空间定义
         self._observation_space = spaces.Dict(
             {
                 'image': spaces.Box(
@@ -52,6 +65,7 @@ class VisionEnvVec(VecEnv):
             high=np.ones(self.act_dim) * 1.0,
             dtype=np.float64,
         )
+        #3) 初始化观测缓存
         self._observation = {'image': np.zeros([self.num_envs, n_seq, self.img_height, self.img_width], dtype=np.uint8),
                             'state': np.zeros([self.num_envs, n_seq, self.goal_obs_dim], dtype=np.float64)}
         self._state_observation = np.zeros([self.num_envs, self.goal_obs_dim], dtype=np.float64)
@@ -67,7 +81,7 @@ class VisionEnvVec(VecEnv):
             [self.num_envs, self.img_width * self.img_height], dtype=np.float32
         )
         self.label_images = np.zeros([28, 28], dtype=np.float32)
-        #
+        #4) 奖励与 done 缓存
         self._reward_components = np.zeros(
             [self.num_envs, n_seq, self.rew_dim], dtype=np.float64
         )
@@ -76,7 +90,7 @@ class VisionEnvVec(VecEnv):
             [self.num_envs, self.rew_dim], dtype=np.float64
         )
         self._single_done = np.zeros((self.num_envs), dtype=np.bool)
-
+        #5) 额外信息和统计
         self._extraInfoNames = self.wrapper.getExtraInfoNames()
         self.reward_names = self.wrapper.getRewardNames()
         self._extraInfo = np.zeros(
@@ -100,6 +114,7 @@ class VisionEnvVec(VecEnv):
         self.obs_rms_new = RunningMeanStd(shape=[self.num_envs, self.obs_dim])
         self.max_episode_steps = 1000
 
+        #6) 序列内存，用于维护 n_seq 历史帧，step()/reset() 里会滚动更新。
         self.image_memory = [[] for _ in range(self.num_envs)]
         self.state_memory = [[] for _ in range(self.num_envs)]
         self.reward_memory = [[] for _ in range(self.num_envs)]
@@ -124,9 +139,34 @@ class VisionEnvVec(VecEnv):
     def getLabelImage(self):
         return self.label_images
 
+    """
+    功能:
+    执行一步环境交互：把动作送入底层环境，获取新的状态/深度图，更新序列观测，并返回 (obs, reward, done, info)。
+    
+    输入:
+    action: 动作数组（若维度不足，会 reshape 成 (num_envs, act_dim)）。
+    
+    输出:
+    obs: 字典，包含 image/state 的序列数据 (num_envs, n_seq, ...)。
+    rewards: 每个环境的即时奖励（取 _single_reward_components 最后一项）。
+    dones: 每个环境的终止标志。
+    info: 额外信息（含 episode 回报统计）。
+    
+    调用关系:
+    被 PPO 的 collect_rollouts() / collect_lstm_rollouts() 中每一步调用，用于生成训练数据。
+    """
     def step(self, action):
+        #1、动作整形
         if action.ndim <= 1:
             action = action.reshape((-1, self.act_dim))
+        """
+        更新当前时刻的状态/奖励/终止标志
+        更新 _state_observation（当前状态向量）
+        写入 _single_reward_components（奖励分量）
+        写入 _single_done（终止标记）
+        写入 _extraInfo（额外信息）
+        """
+        #2、调用底层环境执行一步
         self.wrapper.step(
             action,
             self._state_observation,
@@ -139,22 +179,25 @@ class VisionEnvVec(VecEnv):
         t0 = time.time()
         self.render(0)
         # print("render time: ", time.time() - t0)
-        depth = self.getDepthImage()
+        #3、渲染并获取深度图
+        depth = self.getDepthImage()#获取每个环境的深度图（扁平数组）。
+        #4、更新序列观测（每个环境），删除序列最旧一帧，追加当前图像和当前状态
         for i in range(self.num_envs):
-            img = depth[i, :].reshape(self.img_height, self.img_width)
+            img = depth[i, :].reshape(self.img_height, self.img_width)#把 depth[i] reshape 成 (H, W)。
             # depth_img = Image.fromarray((np.minimum(img, 12.0)) / 12.0 * 255.0)
             # if i==0:
             #     depth_img.convert('RGB').save('step'+str(i)+str(time.time())+'.jpg')
-            img = self.preprocess(img)
-            del self.image_memory[i][:1]
-            del self.state_memory[i][:1]
+            img = self.preprocess(img)#preprocess()：限幅到 12m，再缩放到 0–255。
+            del self.image_memory[i][:1]#滚动更新序列：
+            del self.state_memory[i][:1]#从序列里删除最旧的一帧（实现滑动窗口）。
 
             self.image_memory[i].append(img.copy())
-            self.state_memory[i].append(self._state_observation[i, :].copy())
+            self.state_memory[i].append(self._state_observation[i, :].copy())#把当前帧图像和当前状态追加到序列末尾。
+        #5、组装新的 obs 字典
         self._observation['image'] = np.stack(self.image_memory)
         self._observation['state'] = np.stack(self.state_memory)
         obs = self._observation
-
+        #6、构建 info 与 episode 统计
         info = [{} for i in range(self.num_envs)]
 
         for i in range(self.num_envs):
@@ -170,10 +213,10 @@ class VisionEnvVec(VecEnv):
                     self.sum_reward_components[i, j] = 0.0
                 info[i]["episode"] = epinfo
                 self.rewards[i].clear()
-
+        #7、返回
         return (
             obs,
-            self._single_reward_components[:, -1].copy(),
+            self._single_reward_components[:, -1].copy(),# 取 _single_reward_components 的最后一项（即时奖励）
             self._single_done.copy(),
             info.copy(),
         )
@@ -189,6 +232,20 @@ class VisionEnvVec(VecEnv):
         depth = (np.minimum(image, 12.0)) / 12.0 * 255.0
         return depth.astype('int')
 
+    """
+    功能:
+    重置环境，并构造初始 obs 字典（含 image 和 state 的序列），用于训练/推理起始状态。
+    
+    输入:
+    random: bool：是否随机重置底层环境。
+    
+    输出:
+    obs: 字典，obs['image'] 和 obs['state'] 都是形状 (num_envs, n_seq, ...) 的序列数据。
+
+    调用关系：
+    在训练开始时由 RecurrentPPO 的上层逻辑间接调用（env.reset()）。
+    在测试/评估时也会被调用以获取初始观测。
+    """
     def reset(self, random=True):
         self.wrapper.reset(self._state_observation, random)
         # print(self._state_observation)

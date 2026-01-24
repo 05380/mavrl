@@ -25,7 +25,7 @@ from stable_baselines3.common.utils import explained_variance, get_schedule_fn, 
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common import utils
 
-from mav_baselines.torch.recurrent_ppo.recurrent.buffers import RecurrentDictRolloutBuffer, RecurrentRolloutBuffer, LSTMDictRolloutBuffer
+from mav_baselines.torch.recurrent_ppo.recurrent.buffers import RecurrentDictRolloutBuffer, RecurrentRolloutBuffer, LSTMDictRolloutBuffer# 支持的缓冲区类型
 from mav_baselines.torch.recurrent_ppo.recurrent.policies import RecurrentActorCriticPolicy
 from mav_baselines.torch.recurrent_ppo.recurrent.type_aliases import RNNStates
 from mav_baselines.torch.recurrent_ppo.policies import CnnLstmPolicy, MlpLstmPolicy, MultiInputLstmPolicy
@@ -83,7 +83,16 @@ class RecurrentPPO(OnPolicyAlgorithm):
         "CnnLstmPolicy": CnnLstmPolicy,
         "MultiInputLstmPolicy": MultiInputLstmPolicy,
     }
+    """
+    1. 初始化函数 __init__()
 
+    作用: 配置整个算法的参数和组件
+    关键配置:
+    LSTM 层数 (lstm_layer=1)
+    序列数量 (n_seq=1)
+    重构配置 (reconstruction_members=[True, False, True])
+    训练模式 (only_lstm_training, train_lstm_without_env)
+    """
     def __init__(
         self,
         policy: Union[str, Type[RecurrentActorCriticPolicy]],
@@ -245,6 +254,10 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 env.render(0)
             time.sleep(0.01)
 
+    """
+    2. 模型初始化 _setup_model()
+    作用: 创建网络结构和初始化 LSTM 状态
+    """
     def _setup_model(self) -> None:
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
@@ -355,6 +368,26 @@ class RecurrentPPO(OnPolicyAlgorithm):
 
             self.clip_range_vf = get_schedule_fn(self.clip_range_vf)
 
+    """
+    3. 经验收集 collect_rollouts()
+    作用: 与环境交互收集训练数据
+
+    核心流程:
+    使用 forward_rnn() 获取 LSTM 隐状态
+    将隐状态和动作一起存入缓冲区
+    处理超时截断情况
+
+    重要细节:
+    传递 latent_lstm_pi 和 latent_lstm_vf 到缓冲区
+    使用 lstm_states 维护序列连续性
+
+    📊 核心训练数据
+1. 基本经验元组 (s, a, r, s')
+observations: 环境观测值
+actions: 智能体采取的动作
+rewards: 获得的即时奖励
+values: 状态价值函数估计
+    """
     def collect_rollouts(
         self,
         env: VecEnv,
@@ -377,87 +410,129 @@ class RecurrentPPO(OnPolicyAlgorithm):
         :return: True if function returned with at least `n_rollout_steps`
             collected, False if callback terminated rollout prematurely.
         """
+        #2. 验证和初始化阶段
+            #类型检查确保使用的是支持循环策略的缓冲区类型
+        assert self.env is env, "The environment passed must be the same as the one used when building the model"
         assert isinstance(
             rollout_buffer, (RecurrentRolloutBuffer, RecurrentDictRolloutBuffer, LSTMDictRolloutBuffer)
-        ), f"{rollout_buffer} doesn't support recurrent policy"
+        ), f"{rollout_buffer} doesn't support recurrent policy"#验证缓冲区是否支持循环策略（LSTM），确保使用正确的缓冲区类型以处理序列数据
 
-        assert self._last_obs is not None, "No previous observation was provided"
+        assert self._last_obs is not None, "No previous observation was provided"#确保存在上一次的观测数据，这是开始交互的前提条件
         # Switch to eval mode (this affects batch norm / dropout)
+            # 设置为评估模式
         self.policy.set_training_mode(False)
 
         n_steps = 0
         rollout_buffer.reset()
-        # Sample new weights for the state dependent exploration
+        # SDE噪声重置，如果使用状态依赖探索(SDE)，则重置噪声矩阵为每个环境中都设置相应的噪声！！
         if self.use_sde:
             self.policy.reset_noise(env.num_envs)
 
         callback.on_rollout_start()
-
+            #LSTM 状态初始化,从上次保存的状态开始，保持序列连续性
         lstm_states = deepcopy(self._last_lstm_states)
-
-        if self.if_change_maps:
-            if self.is_forest_env and self.num_timesteps<1.2e6:
+        #3. 环境管理
+        #根据环境类型和训练进度动态调整环境
+        #在早期训练中定期更换地图以增强泛化能力
+        if self.if_change_maps:#如果启用了地图切换功能
+            if self.is_forest_env and self.num_timesteps<1.2e6:#森林环境策略，初等难度，在早期训练阶段提供相对简单的环境
                 self.change_maps(env=env, radius=10.0)
-            elif not self.is_forest_env and iteration<3.2e5:
+            elif not self.is_forest_env and iteration<3.2e5:#非森林环境策略，中等难度，在早期训练阶段降低环境复杂度
                 self.change_maps(env=env, radius=5.0)
-            else:
+            else:#标准环境策略，（训练后期）
                 self.env.resetRewCoeff()
                 self.change_maps(env=env)
             env.reset()
-            
-        while n_steps < n_rollout_steps:
+        #4. 主循环 - 交互和数据收集
+        while n_steps < n_rollout_steps:#持续与环境交互直到达到预定的步数
 
 
-            if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
-                # Sample a new noise matrix
+            if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:#条件: 使用SDE且达到重置频率
+                # 定期重置探索噪声，增加策略探索的多样性
                 self.policy.reset_noise(env.num_envs)
 
-            with th.no_grad():
-                # Convert to pytorch tensor or to TensorDict
+            with th.no_grad():#禁用梯度计算以节省内存并加速推理
+                #数据预处理，将观测转换为张量并移至指定设备，将episode开始标志转换为张量
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 episode_starts = th.tensor(self._last_episode_starts, dtype=th.float32, device=self.device)
+                """
+                 LSTM前向传播，forward_rnn: 处理序列信息，更新LSTM隐藏状态
+                 输入：
+                 传递当前观测张量、前一个LSTM状态和episode开始标志
+                 返回值：
+                 latent_pi: 策略网络的输出，用于计算策略
+                 latent_vf: 价值网络的输出，用于计算价值
+                 lstm_states: 更新后的LSTM隐藏状态
+                """
                 latent_pi, latent_vf, lstm_states = self.policy.forward_rnn(obs_tensor, lstm_states, episode_starts)
+                #基于LSTM输出生成动作、价值估计和对数概率
+                #根据deterministic参数决定是否使用确定性策略
                 actions, values, log_probs = self.policy.forward(latent_pi, latent_vf, deterministic=deterministic)
-            actions = actions.cpu().numpy()
+            actions = actions.cpu().numpy()#将动作从GPU转移到CPU并转换为NumPy数组，以便与环境交互
 
-            # Rescale and perform action
+            # Rescale and perform action有点多余
             clipped_actions = actions
-            # Clip the actions to avoid out of bound error
-            if isinstance(self.action_space, spaces.Box):
-                clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+            # 执行动作并获得环境反馈
+            #例子：如果动作范围是 [-1.0, 1.0]，而网络输出 [1.2, -0.8]，会被裁剪成 [1.0, -0.8]
+            if isinstance(self.action_space, spaces.Box):#条件检查：判断动作空间是否为连续空间（Box类型）
+                clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)#使用np.clip()将动作限制在 [action_space.low, action_space.high] 范围内
+            """
+            执行动作：将裁剪后的动作发送给环境
+            返回值：
+            新的观测（深度图 + 状态向量序列）、
+            即时奖励（来自配置的7个权重系数）
+            episode是否结束的标志
+            额外信息（如碰撞、超时、奖励分量详情）
+            """
             new_obs, rewards, dones, infos = env.step(clipped_actions)
-            self.num_timesteps += env.num_envs
+            self.num_timesteps += env.num_envs#更新训练步数计数器，如果有4个并行环境，每调用一次step()就执行了4步，所以 num_timesteps += 4
             # print("render time: ", time.time() - t0)
             # Give access to local variables
             callback.update_locals(locals())
             if callback.on_step() is False:
                 return False
 
-            self._update_info_buffer(infos)
-            n_steps += 1
+            self._update_info_buffer(infos)#更新episode信息缓存
+            n_steps += 1#增加当前rollout步数计数
 
+            #将离散动作重塑为列向量格式
             if isinstance(self.action_space, spaces.Discrete):
                 # Reshape in case of discrete action
                 actions = actions.reshape(-1, 1)
 
             # Handle timeout by bootstraping with value function
             # see GitHub issue #633
-            for idx, done_ in enumerate(dones):
+            # 时间限制截断处理
+            for idx, done_ in enumerate(dones):#遍历每个环境中episode的结束状态，dones: 布尔数组，指示每个环境的episode是否结束
+                """三重条件检查
+                done_: 当前环境episode结束
+                terminal_observation存在: 环境提供了截断时刻的观测
+                TimeLimit.truncated=True: 确认是时间限制导致的截断（而非任务完成或失败）
+                """
                 if (
                     done_
                     and infos[idx//self.n_seq].get("terminal_observation") is not None
                     and infos[idx//self.n_seq].get("TimeLimit.truncated", False)
                 ):
+                    #获取截断时刻的观测数据,转换为张量格式
                     terminal_obs = self.policy.obs_to_tensor(infos[idx//self.n_seq]["terminal_observation"])[0]
+                    """
+                    LSTM状态提取
+                    提取对应环境的LSTM隐藏状态和细胞状态
+                    使用切片操作提取特定环境的状态
+                    contiguous()确保内存连续性
+                    """
                     with th.no_grad():
                         terminal_lstm_state = (
                             lstm_states.vf[0][:, idx : idx + 1, :].contiguous(),
                             lstm_states.vf[1][:, idx : idx + 1, :].contiguous(),
                         )
-                        # terminal_lstm_state = None
+                        # terminal_lstm_state = None,创建episode开始标志（False表示不是新episode）,使用价值网络预测剩余折扣回报
                         episode_starts = th.tensor([False], dtype=th.float32, device=self.device)
                         terminal_value = self.policy.predict_values(terminal_obs, terminal_lstm_state, episode_starts)[0]
+                    #将估计的未来价值加入当前奖励,使用折扣因子γ平衡当前和未来奖励
                     rewards[idx] += self.gamma * terminal_value
+            #5. 数据存储
             rollout_buffer.add(
                 self._last_obs,
                 actions,
@@ -469,12 +544,12 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 latent_lstm_pi=latent_pi,
                 latent_lstm_vf=latent_vf,
             )
-
+            #6. 状态更新
             self._last_obs = new_obs
             self._last_episode_starts = dones
             self._last_lstm_states = lstm_states
 
-
+        #7. 末尾价值计算,计算最后一个时间步的价值作为GAE计算的起始点
         with th.no_grad():
             # Compute value for the last timestep
             episode_starts = th.tensor(dones, dtype=th.float32, device=self.device)
@@ -604,7 +679,14 @@ class RecurrentPPO(OnPolicyAlgorithm):
 
         return True
 
-    #更新策略网络，使用已收集的经验数据优化策略，提高智能体的性能。
+    """
+    4. 策略训练 train()
+    作用: 使用 PPO 算法更新策略网络
+    关键部分:
+    使用 get_ppo_need() 获取特定数据格式
+    计算 PPO 损失（策略梯度、价值函数、熵）
+    实现 KL 散度早停机制
+    """
     def train(self) -> None:
         
         """
@@ -774,6 +856,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
 
+    """
+    多难度评估（简单、中等、困难）
+    """
     def eval(self, iteration, if_eval=True, max_ep_length=1000) -> None:
         save_path = self.logger.get_dir() + "/TestTraj"
         save_vis_path = self._logger.get_dir() + "/TSNE/" + "TSNE_{0:05d}".format(iteration)
@@ -920,6 +1005,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
     def eval_from_outer(self, iteration) -> None:
         self.eval(iteration, if_eval=False, max_ep_length=10000)
 
+    """
+    动态切换训练环境
+    """
     def change_maps(self, env, seed=-1, radius=-1.0, if_eval=False):
         self.finished_save_pc = False
         self.env.spawnObstacles(change_obs=True, seed=seed, radius=radius)
@@ -1020,6 +1108,10 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 os.makedirs(policy_path, exist_ok=True)
                 self.policy.save(self.logger.get_dir() + "/Policy" + "/iter_{0:05d}.pth".format(epoch))
     
+    """
+    从预存数据集训练 LSTM
+    支持未来帧预测重构
+    """
     def train_lstm_from_dataset(self):
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
@@ -1128,6 +1220,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
             mae, std = self.lstm_test_loss_std(observations, recon, n_seq)
             print('====> Test set loss: {:.4f}, std: {:.4}'.format(mae, std))
 
+    """
+    重构图像可视化
+    """
     def plot_test_image(self, obs, recon, n_seq, epoch):
         if isinstance(obs, dict):
             obs = obs['image']
@@ -1207,6 +1302,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
                      lstm_states=lstm_states, episode_starts=episode_starts)
 
 
+    """
+    支持过去/当前/未来帧重构
+    """
     def lstm_loss_function(self, obs, obs_recon, n_seq, epoch):
         if isinstance(obs, dict):
             obs = obs['image'].float() / 255.0
