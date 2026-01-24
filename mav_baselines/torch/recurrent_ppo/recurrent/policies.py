@@ -442,7 +442,26 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
     训练时用于生成 rollout 数据和 PPO 损失所需量。
     """
     def forward(self, latent_pi: th.Tensor, latent_vf: th.Tensor,deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        前置步骤（forward_rnn 方法）：
+        观测（图像 + 状态）经过 CNN 提取图像特征。
+        图像特征送入 LSTM 处理时序关系，得到 latent_pi（LSTM 输出 + 状态拼接）。
+        latent_pi 传递给 forward 方法。
+
+        ：原始 latent_pi 可能包含噪声或冗余信息，
+        MLP 通过多层变换提取关键模式，提高决策质量。
         #将LSTM输出变换为适合生成动作分布的特征向量，给策略分支用的高层特征
+        在 Actor-Critic 架构中，策略网络（Actor）需要将低级特征
+        （如 CNN 提取的图像特征 + LSTM 处理的时序特征 + 状态向量）
+        转换为适合动作分布（例如高斯分布或 Beta 分布）的输入。
+
+        内部过程：
+        应用线性层 + 激活函数（默认 nn.Tanh）的多层变换。
+
+        forward_actor 方法执行多层感知机（MLP）的正向传播，
+        应用非线性变换（如激活函数），以提取更抽象的特征，提高策略的表达能力。
+        这一步还是属于actor网络中干的事情
+        """
         latent_pi_ = self.mlp_extractor.forward_actor(latent_pi)
         #为价值函数生成输入特征，给价值分支用的高层特征。
         latent_vf_ = self.mlp_extractor.forward_critic(latent_vf)
@@ -579,6 +598,8 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
     """
     功能:
+    当模型已训练好，推理时我们使用 predict() 方法
+    来生成动作。
     根据当前观测估计状态价值 (V(s))。
 
     输入:

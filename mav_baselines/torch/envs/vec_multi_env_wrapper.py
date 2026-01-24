@@ -140,7 +140,11 @@ class VisionEnvVec(VecEnv):
         return self.label_images
 
     """
+    RecurrentPPO.collect_rollouts() 或类似方法会调用策略的 forward_rnn() 获取 latent_pi 和 latent_vf，然后调用 forward() 生成 actions。
+    生成的 actions 被传递给环境的 step(action) 方法，作为输入执行环境交互。
+
     功能:
+    接收动作，更新底层环境，渲染新深度图，滚动更新序列（删除最旧帧，追加新帧），返回更新后的 obs。
     执行一步环境交互：把动作送入底层环境，获取新的状态/深度图，更新序列观测，并返回 (obs, reward, done, info)。
     
     输入:
@@ -154,6 +158,11 @@ class VisionEnvVec(VecEnv):
     
     调用关系:
     被 PPO 的 collect_rollouts() / collect_lstm_rollouts() 中每一步调用，用于生成训练数据。
+    
+    先调用 env.reset() 获取初始观测（obs），初始化环境状态和序列内存（例如填充 n_seq 帧的历史数据）。
+    
+    在 RecurrentPPO.train() 或 collect_rollouts() 中，先 obs = env.reset()，然后在循环中
+    obs, reward, done, info = env.step(actions)。如果 done，则 obs = env.reset()。
     """
     def step(self, action):
         #1、动作整形
@@ -234,7 +243,7 @@ class VisionEnvVec(VecEnv):
 
     """
     功能:
-    重置环境，并构造初始 obs 字典（含 image 和 state 的序列），用于训练/推理起始状态。
+    重置环境，填充 image_memory 和 state_memory，并构造初始 obs 字典（含 image 和 state 的序列），用于训练/推理起始状态。
     
     输入:
     random: bool：是否随机重置底层环境。
@@ -245,6 +254,10 @@ class VisionEnvVec(VecEnv):
     调用关系：
     在训练开始时由 RecurrentPPO 的上层逻辑间接调用（env.reset()）。
     在测试/评估时也会被调用以获取初始观测。
+
+    训练/评估开始：先调用 env.reset() 获取初始观测（obs），初始化环境状态和序列内存（例如填充 n_seq 帧的历史数据）。
+    交互循环：然后循环调用 env.step(action) 执行动作、获取新观测、奖励和终止标志，直到 episode 结束（done=True）。
+    Episode 重置：当 done=True 时，再次调用 reset() 开始新 episode。
     """
     def reset(self, random=True):
         self.wrapper.reset(self._state_observation, random)
@@ -283,6 +296,10 @@ class VisionEnvVec(VecEnv):
     def getProgress(self):
         return self._reward_components[:, 0]
 
+    """
+    如果需要深度图（用于观测），应调用 getDepthImage() 而非 getImage。
+    在项目中，观测主要基于深度图（obs['image']），RGB/灰度图像更多用于辅助。
+    """
     def getImage(self, rgb=False):
         if rgb:
             self.wrapper.getImage(self._rgb_img_obs, True)
@@ -291,6 +308,10 @@ class VisionEnvVec(VecEnv):
             self.wrapper.getImage(self._gray_img_obs, False)
             return self._gray_img_obs.copy()
 
+    """
+    从底层环境（self.wrapper，
+    如 Unity 或 Gazebo 仿真器）获取深度图像数据，用于提供环境的视觉观测。
+    """
     def getDepthImage(self):
         has_img = False
         # while(not has_img):
