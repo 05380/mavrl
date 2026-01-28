@@ -382,11 +382,11 @@ class RecurrentPPO(OnPolicyAlgorithm):
     使用 lstm_states 维护序列连续性
 
     📊 核心训练数据
-1. 基本经验元组 (s, a, r, s')
-observations: 环境观测值
-actions: 智能体采取的动作
-rewards: 获得的即时奖励
-values: 状态价值函数估计
+    1. 基本经验元组 (s, a, r, s')
+    observations: 环境观测值
+    actions: 智能体采取的动作
+    rewards: 获得的即时奖励
+    values: 状态价值函数估计
     """
     def collect_rollouts(
         self,

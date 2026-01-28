@@ -19,6 +19,17 @@ import mav_baselines
 import sys
 sys.modules['rpg_baselines_prev'] = mav_baselines
 
+"""
+这个文件（avoider_vel_cmd.py）是“在线推理 + ROS 通信”的节点：
+从 ROS 里拿到深度图、里程计、目标点，把它们整理成 RL policy 的输入，
+然后输出速度指令给无人机控制器。
+
+vec_multi_env_wrapper.py 并不是从 ROS 取深度图，
+它是从底层仿真环境 wrapper 取深度图；而 avoider_vel_cmd.py 
+是真正的 ROS 节点，从 ROS 话题订阅深度图。两者目的不同：
+一个用于训练/仿真采样，一个用于在线推理控制。
+
+"""
 class RobotState:
     def __init__(self, cfg, dim=4) -> None:
         self.acc = np.zeros(dim-1, dtype=np.float64)
@@ -109,7 +120,7 @@ class AvoiderNode:
         self.lstm_states = None
         self.depth = np.zeros((self.input_height, self.input_width))
         self.net_initialized = False
-        self.depth_queue = collections.deque([], maxlen=self.input_update_freq)
+        self.depth_queue = collections.deque([], maxlen=self.input_update_freq)#定时器调用
         self.state_queue = collections.deque([], maxlen=self.input_update_freq)
         self.time_prediction = None
         self.reset_queue()
@@ -126,7 +137,7 @@ class AvoiderNode:
             self.depth_sub = rospy.Subscriber('/depth', Image, self.depth_callback, queue_size=1)
         self.ground_truth_odom_sub = rospy.Subscriber('/hummingbird/agiros_pilot/odometry', Odometry, self.ground_truth_odom_callback, queue_size=1)
         self.target_sub = rospy.Subscriber('/hummingbird/goal_point', Path, self.target_callback, queue_size=1)
-        self.timer_input = rospy.Timer(rospy.Duration(1.0 / self.input_update_freq), self.update_input_queue)
+        self.timer_input = rospy.Timer(rospy.Duration(1.0 / self.input_update_freq), self.update_input_queue)#把 update_input_queue 注册成 ROS 定时器回调，每(1.0 / self.input_update_freq) 秒调用一次
         self.timer_network = rospy.Timer(rospy.Duration(1.0 / self.input_update_freq), self._generate_command)
         self.timer_command = rospy.Timer(rospy.Duration(1.0 / 30), self.send_command)
 
@@ -170,6 +181,45 @@ class AvoiderNode:
             new_list.append(input_list[i])
         return new_list
 
+    """
+    功能
+    把缓存队列里的“深度图序列 + 状态序列”整理成网络输入 self.net_inputs（字典：image + state）。
+    在未初始化或还没收到状态时，先构造全零的占位输入。
+
+    输入
+    隐式输入（来自成员变量）：
+    self.depth_queue：历史深度图队列
+    self.state_queue：历史状态队列（位置/速度/目标/姿态）
+    self.input_update_freq、self.seq_len、self.goal_obs_dim、self.input_height、self.input_width
+    self.net_initialized、self.get_state
+
+    输出
+    无显式返回值
+    主要副作用：设置
+    self.required_elements（从队列里采样的索引）
+    self.net_inputs（网络输入字典）
+    self.time_prediction（推理时间戳）
+
+    主要逻辑
+    未初始化或还没拿到状态时：
+    计算 required_elements（按 seq_len 抽取队列索引）
+    生成全零输入：
+    image: (1, seq_len, H, W)
+    state: (1, seq_len, goal_obs_dim)
+    写入 self.net_inputs 并返回
+    正常推理时：
+    从 depth_queue 取出需要的帧，组成 image
+    从 state_queue 取出需要的帧，取最新状态 state_inputs
+    用 state_inputs 更新 RobotState（位置/速度/姿态）
+    用 calRLState 计算 7 维状态特征
+    组装 new_dict → self.net_inputs
+
+    调用关系
+    由 _generate_command 定时器回调调用
+    _generate_command → _prepare_net_inputs → policy.predict(...)
+    如果你想，我可以再补一张“state_queue 里每一项的字段含义”小表格，方便你对照。
+
+    """
     def _prepare_net_inputs(self):
         if not self.net_initialized or not self.get_state:
             required_elements = np.arange(start=0, stop=self.input_update_freq,
@@ -220,6 +270,34 @@ class AvoiderNode:
         self.episode_starts = None
         print("target: ", self.target)
 
+    """
+    功能
+    定时采样当前“状态 + 目标 + 姿态”和“深度图”，推入队列，用于后续构造网络输入。
+
+    输入
+    显式参数：data（ROS Timer 回调参数，函数本身不用）
+    隐式依赖：
+    self.target（目标点）
+    self.odometry（里程计）
+    self.rot_body（姿态四元数，来自 odom）
+    self.depth（最新深度图）
+
+    输出
+    无返回值
+    副作用：
+    self.state_queue.append(state_inputs)
+    self.depth_queue.append(self.depth)
+    self.get_state = True
+
+    调用关系
+    在 __init__ 中通过定时器注册：
+    self.timer_input = rospy.Timer(..., self.update_input_queue)
+    被 ROS 定时器周期调用（频率 input_update_freq）。把数据写入 state_queue/depth_queue
+
+    state_inputs 内容结构
+    [pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, target_x, target_y, target_z] + quat(4)
+    即 3+3+3+4 = 13 维。
+    """
     def update_input_queue(self, data):
         if self.target is None or self.odometry is None:
             return
