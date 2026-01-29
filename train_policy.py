@@ -192,7 +192,7 @@ def main():
           net_arch=[dict(pi=[256, 256], vf=[512, 512])],
           log_std_init=-0.5,
           use_beta = False,
-      ),
+      ),#初始化后会在 _setup_model() 里创建 policy 配置策略网络（Actor/Critic）的结构与行为。
       env=train_env,
       learning_rate=learning_rate_schedule,
       eval_env=eval_env,

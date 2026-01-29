@@ -34,7 +34,30 @@ SelfRecurrentPPO = TypeVar("SelfRecurrentPPO", bound="RecurrentPPO")
 from torch.utils.tensorboard.writer import SummaryWriter
 import threading
 from data.loaders import RolloutLSTMSequenceDataset, RosbagSequenceDataset
+"""
+算法-网络分离
+RecurrentPPO 负责算法流程（如何训练、何时更新、如何计算损失）
+RecurrentActorCriticPolicy 负责网络结构（LSTM 层、Actor、Critic 网络）
 
+基于 Stable-Baselines3 的 OnPolicyAlgorithm 扩展。
+除了标准 PPO，它还支持：
+序列（LSTM）策略：维护 LSTM hidden/cell
+Unity 视觉环境交互：动态换图 + 点云读写
+离线 LSTM 训练：不依赖环境，直接用 .npz 序列数据
+VAE 特征迁移：把 VAE encoder 权重加载进 CNN 特征提取器
+LSTM 重建任务：past/now/future 图像重建
+
+典型调用场景:
+train_policy.py
+→ 在线 PPO 训练（RecurrentPPO.learn）
+collect_data.py
+→ 保存 LSTM 数据集（RecurrentPPO.learn_lstm + save_lstm_rollout）
+train_lstm_without_env.py
+→ 离线训练 LSTM（RecurrentPPO.train_lstm_from_dataset）
+fine_tune_lstm_from_rosbag.py
+→ rosbag 微调
+
+"""
 class RecurrentPPO(OnPolicyAlgorithm):
     """
     Proximal Policy Optimization algorithm (PPO) (clip version)
@@ -97,26 +120,30 @@ class RecurrentPPO(OnPolicyAlgorithm):
         self,
         policy: Union[str, Type[RecurrentActorCriticPolicy]],
         env: Union[GymEnv, str] = None,
+        #PPO基本超参数
         learning_rate: Union[float, Schedule] = 1e-4,
         n_steps: int = 128,
-        use_tanh_act: bool = True,
+        use_tanh_act: bool = True,#新加，是否在动作网络后添加Tanh激活函数 用途：限制动作输出范围
         batch_size: Optional[int] = 128,
         n_epochs: int = 10,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
-        clip_range: Union[float, Schedule] = 0.2,
-        clip_range_vf: Union[None, float, Schedule] = None,
-        normalize_advantage: bool = True,
-        ent_coef: float = 0.0,
-        vf_coef: float = 0.5,
+        clip_range: Union[float, Schedule] = 0.2,#新加
+        clip_range_vf: Union[None, float, Schedule] = None,#新加
+        normalize_advantage: bool = True,#新加
+        ent_coef: float = 0.0,#作用：熵系数，鼓励探索
+        vf_coef: float = 0.5,#价值函数损失的权重
         max_grad_norm: float = 0.5,
         use_sde: bool = False,
+        #训练模式开关：retrain, only_lstm_training, save_lstm_dateset, train_lstm_without_env, fine_tune_from_rosbag
         retrain: bool = False,
+        #LSTM / 序列相关：lstm_layer, n_seq, features_dim, states_dim, reconstruction_members, reconstruction_steps
         lstm_layer = 1,
         n_seq = 1,
         sde_sample_freq: int = -1,
-        target_kl: Optional[float] = None,
+        target_kl: Optional[float] = None,#KL散度目标值 早停机制，防止过度更新
         tensorboard_log: Optional[str] = None,
+        #环境与日志：env, eval_env, tensorboard_log, env_cfg
         eval_env: Union[GymEnv, str] = None,
         policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
@@ -133,7 +160,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
         reconstruction_members: Optional[List[bool]] = [True, False, True],
         reconstruction_steps: int = 2,
         save_lstm_dateset: bool = False,
-        train_lstm_without_env: bool = False,
+        train_lstm_without_env: bool = False,#是否在无环境情况下训练LSTM 使用数据集训练
         fine_tune_from_rosbag: bool = False,
         lstm_dataset_path: Optional[str] = None,
         lstm_weight_saved_path: Optional[str] = 'LSTM_weights',
@@ -155,7 +182,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
             verbose=verbose,
             seed=seed,
             device=device,
-            _init_setup_model=False,
+            _init_setup_model=False,#父类不会立刻构建网络，后面会由 RecurrentPPO 自己决定什么时候 _setup_model()
             supported_action_spaces=(
                 spaces.Box,
                 spaces.Discrete,
@@ -382,7 +409,6 @@ class RecurrentPPO(OnPolicyAlgorithm):
     使用 lstm_states 维护序列连续性
 
     📊 核心训练数据
-    1. 基本经验元组 (s, a, r, s')
     observations: 环境观测值
     actions: 智能体采取的动作
     rewards: 获得的即时奖励
@@ -857,7 +883,17 @@ class RecurrentPPO(OnPolicyAlgorithm):
             self.logger.record("train/clip_range_vf", clip_range_vf)
 
     """
-    多难度评估（简单、中等、困难）
+    评估与环境交互
+    1 eval() / eval_from_outer()
+    在不同难度地图上 rollout
+    保存轨迹 csv
+    记录成功率、奖励等
+    2 change_maps()
+    Unity 地图切换 + 点云生成/读取
+    训练和评估都用它
+    由 if_change_maps 和 is_forest_env 控制难度策略
+    3 rendering_thread()
+    单独线程调用 env.render(0)，避免阻塞训练
     """
     def eval(self, iteration, if_eval=True, max_ep_length=1000) -> None:
         save_path = self.logger.get_dir() + "/TestTraj"
@@ -1354,6 +1390,20 @@ class RecurrentPPO(OnPolicyAlgorithm):
             std = th.std(diff_2)
         return BCE.item(), std.item()
 
+    """
+    离线 LSTM 训练路径（不跑环境）
+    1 learn_lstm()
+    采样改用 collect_lstm_rollouts()（或直接保存数据集）
+    如果 save_lstm_dateset=True：调用 save_lstm_rollout() 保存 .npz
+    否则：进入 train_lstm() 用重建损失训练
+    2 train_lstm_from_dataset()
+    读取 .npz 序列数据
+    用 policy.predict_lstm() 做重建预测
+    用 lstm_loss_function() 计算 MSE（past/now/future）
+    保存 LSTM 权重
+    3 fine_tune_lstm_from_rosbag()
+    类似离线训练，但数据来自 rosbag
+    """
     def learn_lstm(
         self: SelfRecurrentPPO,
         total_timesteps: int,

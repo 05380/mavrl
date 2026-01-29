@@ -91,10 +91,11 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         squash_output: bool = False,
         features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
         features_extractor_kwargs: Optional[Dict[str, Any]] = None,
-        share_features_extractor: bool = True,
+        share_features_extractor: bool = True,#新加段
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        #新加段
         lstm_hidden_size: int = 256,
         n_lstm_layers: int = 1,
         shared_lstm: bool = False,

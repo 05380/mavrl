@@ -6,7 +6,15 @@ import torch
 from stable_baselines3.common.utils import get_device
 from mav_baselines.torch.recurrent_ppo.policies import MultiInputLstmPolicy
 from mav_baselines.torch.recurrent_ppo.ppo_recurrent import RecurrentPPO
+"""
+*用真实 rosbag 深度图序列“微调 LSTM 重建模块”**的入口脚本。
+它加载已有 PPO 策略权重与 VAE 权重，再调用
+ RecurrentPPO.fine_tune_lstm_from_rosbag() 完成离线微调。
 
+ 
+
+
+"""
 def parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", type=int, default=1, help="Train the policy or evaluate the policy")
