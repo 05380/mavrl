@@ -50,10 +50,13 @@ LSTM 重建任务：past/now/future 图像重建
 典型调用场景:
 train_policy.py
 → 在线 PPO 训练（RecurrentPPO.learn）
+
 collect_data.py
 → 保存 LSTM 数据集（RecurrentPPO.learn_lstm + save_lstm_rollout）
+
 train_lstm_without_env.py
 → 离线训练 LSTM（RecurrentPPO.train_lstm_from_dataset）
+
 fine_tune_lstm_from_rosbag.py
 → rosbag 微调
 
@@ -151,7 +154,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
         device: Union[th.device, str] = "auto",
         env_cfg: str = None,
         _init_setup_model: bool = True,
-        state_vae: Optional[Dict[str, Any]] = None,
+        state_vae: Optional[Dict[str, Any]] = None,#当 state_vae 不为 None 时，代码会在初始化过程中加载预训练的VAE编码器权重到CNN特征提取器中
         features_dim: int = 32,
         states_dim: int = 0,
         only_lstm_training: bool = False,
@@ -165,7 +168,21 @@ class RecurrentPPO(OnPolicyAlgorithm):
         lstm_dataset_path: Optional[str] = None,
         lstm_weight_saved_path: Optional[str] = 'LSTM_weights',
     ):
-        super().__init__(
+        """
+        RecurrentPPO 构造函数把 policy 交给父类处理
+        RecurrentPPO.__init__() 里调用了父类 OnPolicyAlgorithm.__init__()，
+        把 policy 原样传进去。
+        父类会做一件事：如果 policy 是字符串，就把它解析成真正的类，
+        并写进 self.policy_class。
+
+        所以父类在解析 "MultiInputLstmPolicy" 时，会查到对应的类
+        RecurrentMultiInputActorCriticPolicy，并设置：self.policy_class = RecurrentMultiInputActorCriticPolicy
+
+        之后 _setup_model 用的就是 self.policy_class
+        _setup_model() 里写的是 self.policy = self.policy_class(...)，
+        因此最终创建出来的 policy 就是 RecurrentMultiInputActorCriticPolicy 的实例。
+        """
+        super().__init__(        
             policy,
             env,
             learning_rate=learning_rate,
@@ -217,7 +234,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
         self.train_lstm_without_env = train_lstm_without_env
         self.lstm_dataset_path = lstm_dataset_path
         self.fine_tune_from_rosbag = fine_tune_from_rosbag
-
+        #继续训练/微调已有模型：retrain=1 加载 state_vae 的 encoder 权重到特征提取器
         if self.retrain:
             self.policy = policy
             if self.state_vae is not None:
@@ -239,6 +256,13 @@ class RecurrentPPO(OnPolicyAlgorithm):
                     'features_extractor.fc_logsigma.weight': self.state_vae['state_dict']['encoder.fc_logsigma.weight'],
                     'features_extractor.fc_logsigma.bias': self.state_vae['state_dict']['encoder.fc_logsigma.bias'],
                 }
+                """
+                trainvae.py 训练出 VAE（含 encoder 权重）。
+                训练 PPO 时，如果 state_vae 被传进来：
+                把 VAE encoder 权重 加载到 policy 的 Encoder（作为初始化）。
+                然后 PPO 训练继续更新这个 Encoder（除非你手动冻结）
+                """
+                #pretrained_cnn 是把 VAE encoder 的权重“拷贝”到 policy 的
                 self.policy.load_state_dict(pretrained_cnn, strict=False)
                 self.policy = self.policy.to(self.device)
 
@@ -283,7 +307,38 @@ class RecurrentPPO(OnPolicyAlgorithm):
 
     """
     2. 模型初始化 _setup_model()
-    作用: 创建网络结构和初始化 LSTM 状态
+    功能
+    初始化/构建策略网络与相关训练结构：学习率调度、随机种子、Policy、LSTM 初始状态、
+    RolloutBuffer、clip 调度器。
+    在非 retrain 模式下创建新的 policy，并可选加载state_vae 的 encoder 权重到特征提取器；
+    可选在动作头后接 Tanh。
+    为 actor/critic LSTM 创建全零的 hidden/cell 初始状态，并创建对应的序列缓冲区。
+
+    输入（无显式参数，依赖 self 状态）
+
+    结构/网络相关：self.policy_class, self.observation_space, self.action_space, self.policy_kwargs, self.lstm_layer, self.features_dim, self.states_dim, self.reconstruction_members, self.reconstruction_steps, self.use_tanh_act, self.use_sde
+    训练相关：self.n_steps, self.n_envs, self.gamma, self.gae_lambda, self.n_seq, self.clip_range, self.clip_range_vf
+    运行模式：self.only_lstm_training, self.retrain
+    预训练权重/设备：self.state_vae, self.device
+    外部类型依赖：LSTMDictRolloutBuffer, RecurrentDictRolloutBuffer, RecurrentActorCriticPolicy, RNNStates, get_schedule_fn, torch
+
+    输出
+    返回 None，主要是“副作用式”初始化：
+    设置/更新 self.policy（并迁移到 self.device）
+    设置 self._last_lstm_states（actor/critic 的 hidden/cell 初始状态）
+    设置 self.rollout_buffer
+    将 self.clip_range / self.clip_range_vf 转成 schedule 函数
+
+    调用关系
+    主要在 RecurrentPPO.__init__() 中调用，当 _init_setup_model=True 
+    且不处于 train_lstm_without_env/fine_tune_from_rosbag 分支时触发。
+
+    父类 OnPolicyAlgorithm.__init__()如果 policy 是字符串，
+    就把它解析成真正的类，并写进 self.policy_class
+    之后 _setup_model 用的就是 self.policy_class
+    _setup_model() 里写的是 self.policy = self.policy_class(...)，
+    因此最终创建出来的 policy 就是 RecurrentMultiInputActorCriticPolicy 的实例。
+           
     """
     def _setup_model(self) -> None:
         self._setup_lr_schedule()
@@ -312,11 +367,17 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 **self.policy_kwargs,  # pytype:disable=not-instantiable
             )
 
-            # 1) Add Tanh activation to Policy Net
+            # 1) Add Tanh activation to Policy Net 在动作输出层后加 Tanh，把动作限制在 [-1, 1]。 
             if self.use_tanh_act:
                 self.policy.action_net = th.nn.Sequential(
                     self.policy.action_net, th.nn.Tanh()
                 )
+            """
+            可选加载 state_vae encoder 权重
+            作用：把 VAE 的 encoder 卷积层 + 线性层 权重加载到 policy 的 features_extractor 里。
+            通过手动 key 映射，把 encoder.conv* → features_extractor.conv* 等。
+            strict=False：只加载匹配上的层，其它不匹配的忽略，不报错。
+            """
             if self.state_vae is not None:
                 pretrained_cnn = {
                     'features_extractor.conv1.weight': self.state_vae['state_dict']['encoder.conv1.weight'],

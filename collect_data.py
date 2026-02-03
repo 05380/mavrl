@@ -51,7 +51,7 @@ def parser():
 def main():
   args = parser().parse_args()
   # load configurations
-  if args.scene_id == 0:
+  if args.scene_id == 0:#scene_id=0 → 室内场景配置
     cfg = YAML().load(
         open(
             os.environ["AVOIDBENCH_PATH"] + "/../mavrl/configs/control/config_lstm_indoor.yaml", "r"
@@ -63,7 +63,7 @@ def main():
             os.environ["AVOIDBENCH_PATH"] + "/../mavrl/configs/control/config_lstm.yaml", "r"
         )
     )
-
+  
   train_env = AvoidVisionEnv_v1(dump(cfg, Dumper=RoundTripDumper), False)
   train_env = wrapper.VisionEnvVec(train_env, logdir=args.logdir)
   # set random seed

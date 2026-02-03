@@ -33,7 +33,7 @@ from mav_baselines.torch.recurrent_ppo.recurrent.type_aliases import RNNStates
 from mav_baselines.torch.recurrent_ppo.recurrent.rnn_extractor import MultiExtractor, Encoder, Decoder
 from mav_baselines.torch.recurrent_ppo.recurrent.beta_distribution import BetaDistribution, make_proba_distribution
 
-class RecurrentActorCriticPolicy(ActorCriticPolicy):
+class RecurrentActorCriticPolicy(ActorCriticPolicy):#在基础A-C基础上增加了lstm
     """
     Recurrent policy class for actor-critic algorithms (has both policy and value prediction).
     To be used with A2C, PPO and the likes.
@@ -96,18 +96,20 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         #新加段
-        lstm_hidden_size: int = 256,
-        n_lstm_layers: int = 1,
-        shared_lstm: bool = False,
-        enable_critic_lstm: bool = True,
-        states_dim: int = 6,
+
+        lstm_hidden_size: int = 256,# LSTM隐藏层单元数（输出维度）
+        n_lstm_layers: int = 1,# LSTM层数
+        shared_lstm: bool = False,# 是否共享LSTM（策略和价值网络共用）
+        enable_critic_lstm: bool = True,# 是否为价值网络启用单独的LSTM
+        states_dim: int = 6, # 状态向量维度
         features_dim: int = 32,
-        only_lstm_training: bool = False,
-        use_beta: bool = False,
-        reconstruction_members: Optional[List[bool]] = None,
-        reconstruction_steps: int = 2,
-        lstm_kwargs: Optional[Dict[str, Any]] = None,
+        only_lstm_training: bool = False,# 仅LSTM训练模式
+        use_beta: bool = False, # 是否使用Beta分布
+        reconstruction_members: Optional[List[bool]] = None,# 重建组件开关
+        reconstruction_steps: int = 2,# 重建步数（过去/现在/未来帧）
+        lstm_kwargs: Optional[Dict[str, Any]] = None,# LSTM其他参数
     ):
+        #记录 LSTM 输出维度，是否用 Beta 动作分布。
         self.lstm_output_dim = lstm_hidden_size
         self.use_beta = use_beta
         super().__init__(
@@ -139,10 +141,11 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         #     self.vf_features_extractor = self.features_extractor
         # else:
         #     self.vf_features_extractor = features_extractor_class(self.observation_space, **self.features_extractor_kwargs)
+        #LSTM 配置
         self.lstm_kwargs = lstm_kwargs or {}
         self.shared_lstm = shared_lstm
         self.enable_critic_lstm = enable_critic_lstm
-        ## 定义一个策略LSTM网络 - 用于后续forward_rnn（）中的_process_sequence（）将图像特征加上lstm
+        ## LSTM 网络构建，处理图像信息的神经网络 - 作为后续forward_rnn（）中的_process_sequence（）的lstm网络架构参数 将图像特征加上lstm
         self.lstm_actor = nn.LSTM(
             self.features_dim + states_dim,#64 + 0,输入: CNN特征
             lstm_hidden_size,
@@ -181,11 +184,11 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
                 num_layers=n_lstm_layers,
                 **self.lstm_kwargs,
             )
-        # 解码器 - 用于特征重建
+        # 解码器 - 用于特征重建，用于重建图像特征（past/now/future），服务于 LSTM 预测任务。
         self.feature_decoder0 = Decoder(self.observation_space, self.features_dim + states_dim)
         # self.feature_decoder1 = Decoder(self.observation_space, self.features_dim + states_dim)
 
-        # Setup optimizer with initial learning rate
+        # 用 schedule 的初始学习率创建优化器。
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
    
     """
@@ -269,9 +272,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         Part of the layers can be shared.
         """
         self.mlp_extractor = MlpExtractor(
-            self.lstm_output_dim + 7,
-            net_arch=self.net_arch,
-            activation_fn=self.activation_fn,
+            self.lstm_output_dim + 7,#输入维度
+            net_arch=self.net_arch,#来自 policy_kwargs，决定 Actor/ Critic MLP 的层数与宽度。
+            activation_fn=self.activation_fn,#激活函数，比如 ReLU/Tanh。
             device=self.device,
         )
 
@@ -375,6 +378,12 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         cat_vf = []
         for key, _obs in obs.items():
             if key == 'image':#图像数据处理
+                """
+                extract_features() 用的是 policy 自己的特征提取器
+                （例如 rnn_extractor.Encoder）。
+                只有在 state_vae 传入时，会把 VAE encoder 的权重拷贝
+                进这个 Encoder，但此时 PPO 不会调用 VAE 模型本身。
+                """
                 features = self.extract_features(_obs)
                 if self.share_features_extractor:#11共享模式，策略和价值网络使用相同特征表示
                     pi_features = vf_features = features
@@ -407,6 +416,12 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
                     latent_vf, lstm_states_vf = self._process_sequence(vf_features, lstm_states.vf,
                                             episode_starts, self.lstm_critic)
                 elif self.shared_lstm:#实际使用
+                    """ 
+                    Critic 共用 Actor 的 LSTM 输出 — 为了节省计算，价值网络直接使用策略网络的 LSTM 隐藏状态
+                    但梯度只从 Actor 反向传播 — detach() 防止价值网络的梯度流向 LSTM，确保：
+                        LSTM 只根据 Actor 的损失函数更新（通常是 PPO 策略损失）
+                        Critic 的损失不会影响 LSTM 权重
+                    解耦两个网络的优化 — 虽然使用相同的特征，但各自独立优化"""
                     latent_vf = latent_pi.detach()
                     lstm_states_vf = (lstm_states_pi[0].detach(), lstm_states_pi[1].detach())
                 else:
@@ -441,6 +456,17 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
     forward_rnn() 先得到 latent_pi/latent_vf
     再调用 forward() 得到 actions/values/log_prob
     训练时用于生成 rollout 数据和 PPO 损失所需量。
+
+    PPO 在线决策时只做 编码（Encoder）→ LSTM → MLP → 动作分布。
+    解码（Decoder）只在 LSTM 重建训练路径（如 train_lstm_from_dataset() /
+    predict_lstm()）里用来重建图像，不参与动作生成。
+
+    原始图像
+    → extract_features()（Encoder）
+    → LSTM（forward_rnn）
+    → MLP（forward）
+    → _get_action_dist_from_latent()
+    → 采样动作
     """
     def forward(self, latent_pi: th.Tensor, latent_vf: th.Tensor,deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -571,6 +597,10 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
     在 forward_rnn() / get_distribution() / predict_values() 中处理 obs['image'] 时调用。
     to_latent() 也会调用它来获取图像的 latent 表示。
 
+    trainvae.py 训练出 VAE（含 encoder 权重）。
+    训练 PPO 时，如果 state_vae 被传进来：
+    把 VAE encoder 权重 加载到 policy 的 Encoder（作为初始化）。
+    然后 PPO 训练继续更新这个 Encoder（除非你手动冻结）。
     """
     def extract_features(self, obs: th.Tensor, features_extractor: Optional[BaseFeaturesExtractor] = None) -> th.Tensor:
         """
@@ -595,6 +625,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         observation_space = self.observation_space['image']
         #观测预处理，根据 normalize_images 参数决定是否归一化图像
         preprocessed_obs = preprocess_obs(obs, observation_space, normalize_images=self.normalize_images)
+        #self.features_extractor 的具体实现类，在 RecurrentMultiInputActorCriticPolicy 里作为默认的 features_extractor_class
         return features_extractor(preprocessed_obs)
 
     """

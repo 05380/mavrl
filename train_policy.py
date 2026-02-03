@@ -76,6 +76,10 @@ def main():
         )
     )
   #2. 环境初始化阶段
+  """
+  AvoidVisionEnv_v1 是 flightgym 的 Unity 环境接口。
+  VisionEnvVec 是项目的包装器，把环境变成 SB3 可用的 VecEnv 格式。
+  """
   train_env = AvoidVisionEnv_v1(dump(cfg, Dumper=RoundTripDumper), False)
   train_env = wrapper.VisionEnvVec(train_env, logdir=args.logdir)
   # set random seed
@@ -92,7 +96,7 @@ def main():
   
   cfg["simulation"]["num_envs"] = old_num_envs
   cfg["unity"]["render"] = old_render
-  #关键步骤：让评估环境共享训练环境的Unity连接 避免重复建立Unity连接，提高效率
+  #关键步骤：让评估环境 共享训练环境的Unity连接 避免重复建立Unity连接，提高效率
   eval_env.wrapper.setUnityFromPtr(train_env.wrapper.getUnityPtr())
 
   # eval_env.getPointClouds('', 0, False)
