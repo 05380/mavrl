@@ -14,7 +14,7 @@ from ruamel.yaml import YAML, RoundTripDumper, dump
 from stable_baselines3.common.utils import get_device
 from mav_baselines.torch.recurrent_ppo.policies import MultiInputLstmPolicy, CnnLstmPolicy
 from mav_baselines.torch.recurrent_ppo.ppo_recurrent import RecurrentPPO
-
+#从 mav_baselines.torch.envs 包中导入 vec_multi_env_wrapper 模块，使用 as wrapper 将导入的模块重命名为 wrapper，这样在后续代码中可以使用简短的 wrapper 来引用该模块
 from mav_baselines.torch.envs import vec_multi_env_wrapper as wrapper
 unity_ready = False
 save_finished = False

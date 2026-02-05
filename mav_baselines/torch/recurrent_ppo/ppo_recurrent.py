@@ -148,7 +148,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
         tensorboard_log: Optional[str] = None,
         #环境与日志：env, eval_env, tensorboard_log, env_cfg
         eval_env: Union[GymEnv, str] = None,
-        policy_kwargs: Optional[Dict[str, Any]] = None,
+        policy_kwargs: Optional[Dict[str, Any]] = None,#用来决定策略/价值网络的结构与激活函数。
         verbose: int = 0,
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
@@ -291,7 +291,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
             self.set_random_seed(self.seed)
             lstm_logger = utils.configure_logger(self.verbose, self.tensorboard_log, lstm_weight_saved_path, False)
             self.set_logger(lstm_logger)
-        else:
+        else:#_setup_model() 里只有在 not self.retrain 时才会实例化 policy
             if _init_setup_model:
                 self._setup_model()
 

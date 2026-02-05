@@ -66,11 +66,11 @@ class VisionEnvVec(VecEnv):
             dtype=np.float64,
         )
         #3) 初始化观测缓存
-        self._observation = {'image': np.zeros([self.num_envs, n_seq, self.img_height, self.img_width], dtype=np.uint8),
-                            'state': np.zeros([self.num_envs, n_seq, self.goal_obs_dim], dtype=np.float64)}
-        self._state_observation = np.zeros([self.num_envs, self.goal_obs_dim], dtype=np.float64)
+        self._observation = {'image': np.zeros([self.num_envs, n_seq, self.img_height, self.img_width], dtype=np.uint8),#存每个环境的历史深度图序列
+                            'state': np.zeros([self.num_envs, n_seq, self.goal_obs_dim], dtype=np.float64)}#存每个环境的状态序列
+        self._state_observation = np.zeros([self.num_envs, self.goal_obs_dim], dtype=np.float64)#当前时刻的状态向量（没有序列维），每次 step() 从底层环境更新。
         self._observation_test = np.zeros([self.num_envs, self.obs_dim], dtype=np.float64)
-        self._current_state = np.zeros([self.num_envs, self.state_dim], dtype=np.float64)
+        self._current_state = np.zeros([self.num_envs, self.state_dim], dtype=np.float64)#保存底层环境的完整状态（比 goal_obs_dim 更全的状态维度）
         self._rgb_img_obs = np.zeros(
             [self.num_envs, self.img_width * self.img_height * 3], dtype=np.uint8
         )
@@ -83,13 +83,13 @@ class VisionEnvVec(VecEnv):
         self.label_images = np.zeros([28, 28], dtype=np.float32)
         #4) 奖励与 done 缓存
         self._reward_components = np.zeros(
-            [self.num_envs, n_seq, self.rew_dim], dtype=np.float64
+            [self.num_envs, n_seq, self.rew_dim], dtype=np.float64#存奖励分量的序列，形状是(环境数, 序列长度, 奖励维度)。
         )
-        self._done = np.zeros((self.num_envs, n_seq), dtype=np.bool)
+        self._done = np.zeros((self.num_envs, n_seq), dtype=np.bool)#存终止标记的序列，形状 (环境数, 序列长度)，对应历史每一帧是否 done。
         self._single_reward_components = np.zeros(
-            [self.num_envs, self.rew_dim], dtype=np.float64
+            [self.num_envs, self.rew_dim], dtype=np.float64#存当前一步的奖励分量（没有序列维），由底层环境 step() 直接写入。
         )
-        self._single_done = np.zeros((self.num_envs), dtype=np.bool)
+        self._single_done = np.zeros((self.num_envs), dtype=np.bool)#存当前一步的 done 标记（每个环境一个）。
         #5) 额外信息和统计
         self._extraInfoNames = self.wrapper.getExtraInfoNames()
         self.reward_names = self.wrapper.getRewardNames()
@@ -140,8 +140,11 @@ class VisionEnvVec(VecEnv):
         return self.label_images
 
     """
-    RecurrentPPO.collect_rollouts() 或类似方法会调用策略的 forward_rnn() 获取 latent_pi 和 latent_vf，然后调用 forward() 生成 actions。
+    RecurrentPPO.collect_rollouts() 或类似方法会调用策略的 forward_rnn() 
+    获取 latent_pi 和 latent_vf，然后调用 forward() 生成 actions。
     生成的 actions 被传递给环境的 step(action) 方法，作为输入执行环境交互。
+    本质是把动作送进 AvoidBench 的 C++ 环境，让它原地写出 obs、reward、done、extra_info，
+    而奖励的具体公式就是你贴出的 C++ AvoidVisionEnv::step 里那段计算。
 
     功能:
     接收动作，更新底层环境，渲染新深度图，滚动更新序列（删除最旧帧，追加新帧），返回更新后的 obs。
@@ -163,6 +166,7 @@ class VisionEnvVec(VecEnv):
     
     在 RecurrentPPO.train() 或 collect_rollouts() 中，先 obs = env.reset()，然后在循环中
     obs, reward, done, info = env.step(actions)。如果 done，则 obs = env.reset()。
+
     """
     def step(self, action):
         #1、动作整形
@@ -176,7 +180,7 @@ class VisionEnvVec(VecEnv):
         写入 _extraInfo（额外信息）
         """
         #2、调用底层环境执行一步
-        self.wrapper.step(
+        self.wrapper.step(#
             action,
             self._state_observation,
             self._single_reward_components,

@@ -7,6 +7,7 @@ from os.path import join, exists
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import numpy as np
 import torch
+#flightgym 是 AvoidBench 编译出来的 Python 绑定模块，实际就是在调用 AvoidBench 的环境实现。
 from flightgym import AvoidVisionEnv_v1
 from ruamel.yaml import YAML, RoundTripDumper, dump
 from stable_baselines3.common.utils import get_device
@@ -176,7 +177,7 @@ def main():
     policy.load_state_dict(saved_variables["state_dict"], strict=False)
     # policy.log_std_init = -0.5
     policy.to(device)
-  else:#新训练模式
+  else:#新训练模式，只有在 retrain=0 且 train=1 时
     #当不需要加载预训练模型时，直接使用策略名称字符串
     policy = "MultiInputLstmPolicy"
 
@@ -191,7 +192,7 @@ def main():
     model = RecurrentPPO(
       tensorboard_log=log_dir,
       policy=policy,
-      policy_kwargs=dict(
+      policy_kwargs=dict(#会执行这一行（dict 会被构造并传给 RecurrentPPO），但在 retrain=1 且 policy 已经实例化的情况下，它不会用于重新实例化 policy，因此对网络结构基本不起作用。
           activation_fn=torch.nn.ReLU,
           net_arch=[dict(pi=[256, 256], vf=[512, 512])],
           log_std_init=-0.5,
