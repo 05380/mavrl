@@ -35,6 +35,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 import threading
 from data.loaders import RolloutLSTMSequenceDataset, RosbagSequenceDataset
 """
+被train_policy.py 调用，选用MultiInputLstmPolicy，即类 RecurrentMultiInputActorCriticPolicy(RecurrentActorCriticPolicy)
 算法-网络分离
 RecurrentPPO 负责算法流程（如何训练、何时更新、如何计算损失）
 RecurrentActorCriticPolicy 负责网络结构（LSTM 层、Actor、Critic 网络）
@@ -445,7 +446,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 gae_lambda=self.gae_lambda,
                 n_envs=self.n_envs,
                 n_seq=self.n_seq,
-                ppo_input_size=lstm.hidden_size + 7,
+                ppo_input_size=lstm.hidden_size + 8,#原来是+7
             )
 
         # Initialize schedules for policy/value clipping
@@ -540,6 +541,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
 
             with th.no_grad():#禁用梯度计算以节省内存并加速推理
                 #数据预处理，将观测转换为张量并移至指定设备，将episode开始标志转换为张量
+                #_last_obs首次在父类 _setup_learn() 里赋值：self._last_obs = self.env.reset()
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 episode_starts = th.tensor(self._last_episode_starts, dtype=th.float32, device=self.device)
                 """
@@ -551,9 +553,10 @@ class RecurrentPPO(OnPolicyAlgorithm):
                  latent_vf: 价值网络的输出，用于计算价值
                  lstm_states: 更新后的LSTM隐藏状态
                 """
+                #对观测进行第一步处理
                 latent_pi, latent_vf, lstm_states = self.policy.forward_rnn(obs_tensor, lstm_states, episode_starts)
-                #基于LSTM输出生成动作、价值估计和对数概率
-                #根据deterministic参数决定是否使用确定性策略
+                #基于LSTM输出 生成动作、价值估计和对数概率。#根据deterministic参数决定是否使用确定性策略
+                
                 actions, values, log_probs = self.policy.forward(latent_pi, latent_vf, deterministic=deterministic)
             actions = actions.cpu().numpy()#将动作从GPU转移到CPU并转换为NumPy数组，以便与环境交互
 

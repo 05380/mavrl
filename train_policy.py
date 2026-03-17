@@ -81,8 +81,9 @@ def main():
   AvoidVisionEnv_v1 是 flightgym 的 Unity 环境接口。
   VisionEnvVec 是项目的包装器，把环境变成 SB3 可用的 VecEnv 格式。
   """
-  train_env = AvoidVisionEnv_v1(dump(cfg, Dumper=RoundTripDumper), False)
-  train_env = wrapper.VisionEnvVec(train_env, logdir=args.logdir)
+  train_env = wrapper.VisionEnvVec(
+      AvoidVisionEnv_v1(dump(cfg, Dumper=RoundTripDumper), False), logdir=args.logdir
+      )
   # set random seed
   configure_random_seed(args.seed, env=train_env)
 

@@ -64,8 +64,8 @@ def main():
         )
     )
   
-  train_env = AvoidVisionEnv_v1(dump(cfg, Dumper=RoundTripDumper), False)
-  train_env = wrapper.VisionEnvVec(train_env, logdir=args.logdir)
+  train_env = AvoidVisionEnv_v1(dump(cfg, Dumper=RoundTripDumper), False)#AvoidVisionEnv_v1 是 AvoidBench 的 Unity 仿真环境接口
+  train_env = wrapper.VisionEnvVec(train_env, logdir=args.logdir)#把环境整理成 SB3 可用的 VecEnv 格式，维护观测序列、奖励统计、info 结构
   # set random seed
   configure_random_seed(args.seed, env=train_env)
 

@@ -28,7 +28,7 @@ class VisionEnvVec(VecEnv):
     train_env = wrapper.VisionEnvVec(train_env, logdir=args.logdir)
     """
     def __init__(self, impl, logdir=None):
-        self.wrapper = impl
+        self.wrapper = impl#impl传进来的是AvoidVisionEnv_v1(dump(cfg, Dumper=RoundTripDumper)
         """
         1) 读底层环境维度
         从 wrapper 读取：动作维度、序列长度、观测维度、
@@ -37,10 +37,10 @@ class VisionEnvVec(VecEnv):
         """
         self.act_dim = self.wrapper.getActDim()
         self.seq_dim = self.wrapper.getSeqDim()
-        self.obs_dim = self.wrapper.getObsDim()
+        self.obs_dim = self.wrapper.getObsDim()#没怎么被利用
         self.state_dim = self.wrapper.getStateDim()
         self.rew_dim = self.wrapper.getRewDim()
-        self.goal_obs_dim = self.wrapper.getGoalObsDim()
+        self.goal_obs_dim = self.wrapper.getGoalObsDim()#关系到状态这部分的观测
         self.img_width = self.wrapper.getImgWidth()
         self.img_height = self.wrapper.getImgHeight()
         #2) 观测/动作空间定义

@@ -272,7 +272,7 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):#在基础A-C基础上增加
         Part of the layers can be shared.
         """
         self.mlp_extractor = MlpExtractor(
-            self.lstm_output_dim + 7,#输入维度
+            self.lstm_output_dim + 8,#输入维度原来是+7
             net_arch=self.net_arch,#来自 policy_kwargs，决定 Actor/ Critic MLP 的层数与宽度。
             activation_fn=self.activation_fn,#激活函数，比如 ReLU/Tanh。
             device=self.device,
